@@ -1,0 +1,6 @@
+{
+  "name": "Lost Quest",
+  "description": "An AI-powered lost-item recovery platform connecting losters with helpers through rewarded quests, real-time collaboration, and smart moderation.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": []
+}
