@@ -1,0 +1,135 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile information",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "email": { "type": "string" },
+        "profileImage": { "type": "string" },
+        "isVerified": { "type": "boolean" },
+        "walletBalance": { "type": "number" },
+        "rating": { "type": "number" },
+        "activeQuests": { "type": "array", "items": { "type": "string" } },
+        "joinedQuests": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["id", "name", "email"]
+    },
+    "Quest": {
+      "title": "Quest",
+      "description": "Lost item quest/job",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "ownerId": { "type": "string" },
+        "title": { "type": "string" },
+        "category": { "type": "string" },
+        "description": { "type": "string" },
+        "images": { "type": "array", "items": { "type": "string" } },
+        "rewardAmount": { "type": "number" },
+        "status": { "type": "string", "enum": ["ACTIVE", "FOUND_CLAIMED", "UNDER_REVIEW", "COMPLETED", "CANCELLED"] },
+        "locations": { "type": "array", "items": { "$ref": "#/entities/Location" } },
+        "createdAt": { "type": "number" },
+        "helperIds": { "type": "array", "items": { "type": "string" } },
+        "priority": { "type": "string", "enum": ["NORMAL", "HIGH", "CRITICAL"] },
+        "aiRecoverySuggestions": {
+          "type": "object",
+          "properties": {
+            "zones": { "type": "array", "items": { "type": "string" } },
+            "tips": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      },
+      "required": ["ownerId", "title", "status", "createdAt"]
+    },
+    "Location": {
+      "title": "Location",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "lat": { "type": "number" },
+        "lng": { "type": "number" },
+        "instructions": { "type": "string" }
+      }
+    },
+    "Message": {
+      "title": "Message",
+      "description": "Chat message within a quest",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "questId": { "type": "string" },
+        "senderId": { "type": "string" },
+        "senderName": { "type": "string" },
+        "text": { "type": "string" },
+        "imageUrl": { "type": "string" },
+        "timestamp": { "type": "number" },
+        "isSystem": { "type": "boolean" }
+      },
+      "required": ["questId", "senderId", "text", "timestamp"]
+    },
+    "Notification": {
+      "title": "Notification",
+      "description": "User notification",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "type": { "type": "string" },
+        "questId": { "type": "string" },
+        "message": { "type": "string" },
+        "timestamp": { "type": "number" },
+        "isRead": { "type": "boolean" }
+      },
+      "required": ["userId", "type", "message", "timestamp"]
+    },
+    "FoundItemClaim": {
+      "title": "FoundItemClaim",
+      "description": "Submission when a helper finds an item",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "questId": { "type": "string" },
+        "helperId": { "type": "string" },
+        "evidenceImages": { "type": "array", "items": { "type": "string" } },
+        "foundLocation": {
+          "type": "object",
+          "properties": {
+            "lat": { "type": "number" },
+            "lng": { "type": "number" },
+            "address": { "type": "string" }
+          }
+        },
+        "condition": { "type": "string" },
+        "status": { "type": "string", "enum": ["PENDING", "APPROVED", "REJECTED"] },
+        "adminNotes": { "type": "string" }
+      },
+      "required": ["questId", "helperId", "status"]
+    }
+  },
+  "firestore": {
+    "users": {
+      "schema": "User",
+      "description": "Top-level collection for user profiles"
+    },
+    "quests": {
+      "schema": "Quest",
+      "description": "Top-level collection for all discovery quests"
+    },
+    "quests/{questId}/messages": {
+      "schema": "Message",
+      "description": "Subcollection of messages for each quest chat"
+    },
+    "notifications": {
+      "schema": "Notification",
+      "description": "Top-level collection for user notifications (or could be subcollection of users)"
+    },
+    "claims": {
+      "schema": "FoundItemClaim",
+      "description": "Top-level collection for found item evidence submissions"
+    }
+  }
+}

@@ -1,0 +1,135 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helpers
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // --- Users ---
+    match /users/{userId} {
+      function isValidUser(data) {
+        return data.id == userId &&
+               data.name is string && data.name.size() <= 100 &&
+               data.email is string && data.email.size() <= 100 &&
+               data.walletBalance is number &&
+               data.rating is number;
+      }
+
+      allow get: if isSignedIn();
+      allow create: if isOwner(userId) && isValidUser(incoming()) &&
+                      incoming().keys().hasAll(['id', 'name', 'email', 'profileImage', 'isVerified', 'walletBalance', 'rating', 'activeQuests', 'joinedQuests', 'role', 'createdAt', 'updatedAt']) &&
+                      incoming().keys().size() == 12;
+      allow update: if isOwner(userId) && (
+        (incoming().diff(existing()).affectedKeys().hasOnly(['name', 'profileImage', 'activeQuests', 'joinedQuests', 'role', 'updatedAt']) &&
+         isValidUser(incoming()))
+      );
+    }
+
+    // --- Quests ---
+    match /quests/{questId} {
+      function isValidQuest(data) {
+        return data.ownerId is string &&
+               data.title is string && data.title.size() <= 200 &&
+               data.rewardAmount is number && data.rewardAmount >= 0 &&
+               data.status in ['ACTIVE', 'FOUND_CLAIMED', 'UNDER_REVIEW', 'COMPLETED', 'CANCELLED'];
+      }
+
+      allow get: if true; // Public view for ACTIVE quests or signed in users
+      
+      // Separate list rules for query optimization
+      allow list: if resource.data.status == 'ACTIVE';
+      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.helperIds is list && request.auth.uid in resource.data.helperIds;
+
+      allow create: if isSignedIn() && isValidQuest(incoming()) &&
+                      incoming().ownerId == request.auth.uid &&
+                      incoming().createdAt == request.time &&
+                      incoming().updatedAt == request.time &&
+                      isValidId(questId);
+
+      allow update: if isSignedIn() && (
+        // Action: Join
+        (incoming().diff(existing()).affectedKeys().hasOnly(['helperIds', 'updatedAt']) &&
+         incoming().helperIds is list &&
+         incoming().helperIds.size() > existing().helperIds.size() &&
+         request.auth.uid in incoming().helperIds &&
+         incoming().updatedAt == request.time) ||
+        // Action: Change Status/Edit by Owner
+        (isOwner(existing().ownerId) && isValidQuest(incoming()) &&
+         incoming().updatedAt == request.time)
+      );
+    }
+
+    // --- Messages ---
+    match /quests/{questId}/messages/{messageId} {
+      function canAccessQuest() {
+        let questData = get(/databases/$(database)/documents/quests/$(questId)).data;
+        return questData.ownerId == request.auth.uid || 
+               (questData.helperIds is list && request.auth.uid in questData.helperIds);
+      }
+
+      allow list, get: if isSignedIn() && canAccessQuest();
+      allow create: if isSignedIn() && canAccessQuest() &&
+                      incoming().senderId == request.auth.uid &&
+                      incoming().questId == questId &&
+                      incoming().timestamp == request.time;
+    }
+
+    // --- Notifications ---
+    match /notifications/{notifId} {
+      allow list, get: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow create: if isSignedIn() && incoming().timestamp == request.time;
+      allow update: if isOwner(existing().userId) &&
+                      incoming().diff(existing()).affectedKeys().hasOnly(['isRead']);
+    }
+
+    // --- Claims ---
+    match /claims/{claimId} {
+      function isQuestOwner(qId) {
+        return get(/databases/$(database)/documents/quests/$(qId)).data.ownerId == request.auth.uid;
+      }
+
+      allow get: if isSignedIn() && (resource.data.helperId == request.auth.uid || isQuestOwner(resource.data.questId));
+      
+      allow list: if isSignedIn() && (
+        resource.data.helperId == request.auth.uid || 
+        isQuestOwner(resource.data.questId)
+      );
+
+      allow create: if isSignedIn() &&
+                      incoming().helperId == request.auth.uid &&
+                      incoming().createdAt == request.time &&
+                      incoming().status == 'PENDING';
+      
+      allow update: if isSignedIn() && (
+        // Quest owner can approve/reject
+        (isQuestOwner(existing().questId) &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['status', 'adminNotes', 'updatedAt']) &&
+         incoming().status in ['APPROVED', 'REJECTED'] &&
+         incoming().updatedAt == request.time)
+      );
+    }
+  }
+}

@@ -14,7 +14,7 @@ import {
   Bell, 
   Compass, 
   Camera, 
-  DollarSign, 
+  Gift, 
   CheckCircle2, 
   AlertCircle,
   X,
@@ -37,9 +37,21 @@ import {
   Sun
 } from 'lucide-react';
 import { Quest, User, QuestStatus, UserRole, Message, Notification, FoundItemClaim } from './types';
-import { MOCK_USERS, MOCK_QUESTS, CATEGORIES } from './constants';
+import { CATEGORIES } from './constants';
 import { moderateImage, getQuestAIInsights, enhanceClosureReason } from './services/geminiService';
 import { GoogleMap, useJsApiLoader, MarkerF, InfoWindow, Autocomplete } from '@react-google-maps/api';
+import { db, auth } from './firebase';
+import { 
+  onAuthStateChanged, 
+  signOut, 
+  signInWithEmailAndPassword, 
+  createUserWithEmailAndPassword
+} from 'firebase/auth';
+import { 
+  collection, doc, setDoc, getDoc, onSnapshot, query, where, orderBy, getDocs, addDoc, updateDoc, getDocFromServer,
+  serverTimestamp
+} from 'firebase/firestore';
+import { handleFirestoreError, OperationType } from './lib/firestore-utils';
 
 const mapContainerStyle = {
   width: '100%',
@@ -64,6 +76,23 @@ const mapOptions = {
     }
   ]
 };
+
+// --- Helpers ---
+
+function calculateDistance(lat1: number, lon1: number, lat2: number, lon2: number) {
+  const R = 6371e3; // metres
+  const φ1 = lat1 * Math.PI/180;
+  const φ2 = lat2 * Math.PI/180;
+  const Δφ = (lat2-lat1) * Math.PI/180;
+  const Δλ = (lon2-lon1) * Math.PI/180;
+
+  const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
+          Math.cos(φ1) * Math.cos(φ2) *
+          Math.sin(Δλ/2) * Math.sin(Δλ/2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+
+  return R * c; // in metres
+}
 
 // --- Shared Components ---
 
@@ -122,6 +151,8 @@ const Badge = ({ children, color = 'blue' }: { children: ReactNode, color?: stri
 const googleMapsLibraries: ("places" | "drawing" | "geometry" | "visualization")[] = ["places"];
 
 export default function App() {
+  const [isInitializingAuth, setIsInitializingAuth] = useState(true);
+  const [isLoggingIn, setIsLoggingIn] = useState<'LOSTER' | 'HELPER' | null>(null);
   const [isLoggedIn, setIsLoggedIn] = useState(false);
   const [darkMode, setDarkMode] = useState(() => {
     if (typeof window !== 'undefined') {
@@ -130,20 +161,214 @@ export default function App() {
     }
     return false;
   });
-  const [currentUser, setCurrentUser] = useState<User>(MOCK_USERS[0]);
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [activeRole, setActiveRole] = useState<UserRole>(UserRole.LOSTER);
-  const [quests, setQuests] = useState<Quest[]>(MOCK_QUESTS);
+  const [publicQuests, setPublicQuests] = useState<Quest[]>([]);
+  const [ownedQuests, setOwnedQuests] = useState<Quest[]>([]);
+  const [joinedQuests, setJoinedQuests] = useState<Quest[]>([]);
+  
+  const quests = useMemo(() => {
+    const all = [...publicQuests, ...ownedQuests, ...joinedQuests];
+    const unique = new Map();
+    all.forEach(q => unique.set(q.id, q));
+    return Array.from(unique.values());
+  }, [publicQuests, ownedQuests, joinedQuests]);
+
   const [messages, setMessages] = useState<Message[]>([]);
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [claims, setClaims] = useState<FoundItemClaim[]>([]);
   
   // Navigation
-  const [currentPage, setCurrentPage] = useState<'DASHBOARD' | 'MAP' | 'QUESTS' | 'CHAT' | 'PROFILE' | 'ADMIN' | 'ADD_QUEST'>('DASHBOARD');
+  const [currentPage, setCurrentPage] = useState<'DASHBOARD' | 'MAP' | 'QUESTS' | 'CHAT' | 'PROFILE' | 'ADD_QUEST'>('DASHBOARD');
   const [selectedQuestId, setSelectedQuestId] = useState<string | null>(null);
   const [showNotifs, setShowNotifs] = useState(false);
   const [showClaimForm, setShowClaimForm] = useState(false);
+  const [claimImages, setClaimImages] = useState<string[]>([]);
+  const [claimCondition, setClaimCondition] = useState('');
+  const [claimLocation, setClaimLocation] = useState<{lat: number, lng: number, address: string} | null>(null);
+  const [claimDistance, setClaimDistance] = useState<number | null>(null);
+  const [isVerifyingLocation, setIsVerifyingLocation] = useState(false);
   const [showCloseModal, setShowCloseModal] = useState(false);
   const [closingQuestId, setClosingQuestId] = useState<string | null>(null);
+  const [isPublishing, setIsPublishing] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [firestoreReady, setFirestoreReady] = useState<boolean | 'loading' | 'error'>('loading');
+  const [isAuthLoading, setIsAuthLoading] = useState(false);
+  const [tempUser, setTempUser] = useState<any>(null);
+
+  useEffect(() => {
+    async function testConnection() {
+      try {
+        await getDocs(query(collection(db, 'quests'), where('status', '==', 'ACTIVE')));
+        setFirestoreReady(true);
+      } catch (error: any) {
+        console.error("Firestore connectivity test failed:", error);
+        if (error.code === 'unavailable' || (error.message && error.message.includes('the client is offline'))) {
+          setFirestoreReady('error');
+        } else {
+          setFirestoreReady(true);
+        }
+      }
+    }
+    testConnection();
+  }, []);
+
+  const initializeUser = async (firebaseUser: any, selectedRole?: UserRole) => {
+    try {
+      const userRef = doc(db, 'users', firebaseUser.uid);
+      const userSnap = await getDoc(userRef);
+      let userData: User;
+
+      if (!userSnap.exists()) {
+        const role = selectedRole || (firebaseUser.email === 'helper@demo.com' ? UserRole.HELPER : UserRole.LOSTER);
+        
+        userData = {
+          id: firebaseUser.uid,
+          name: firebaseUser.email === 'loster@demo.com' ? 'Demo Loster' : (firebaseUser.email === 'helper@demo.com' ? 'Demo Helper' : (firebaseUser.displayName || firebaseUser.email?.split('@')[0] || 'Guest')),
+          email: firebaseUser.email || 'guest@pakfound.pk',
+          profileImage: `https://api.dicebear.com/7.x/avataaars/svg?seed=${firebaseUser.uid}`,
+          isVerified: true,
+          walletBalance: role === UserRole.LOSTER ? 50000 : 0,
+          rating: 5,
+          activeQuests: [],
+          joinedQuests: [],
+          role: role,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp()
+        };
+        await setDoc(userRef, userData);
+      } else {
+        userData = userSnap.data() as User;
+        if (selectedRole && userData.role !== selectedRole) {
+          await updateDoc(userRef, { role: selectedRole });
+          userData.role = selectedRole;
+        }
+        setActiveRole(userData.role);
+      }
+
+      setCurrentUser(userData);
+      setIsLoggedIn(true);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, 'users');
+    }
+  };
+
+  useEffect(() => {
+    const unsubAuth = onAuthStateChanged(auth, async (firebaseUser) => {
+      try {
+        if (firebaseUser) {
+          await initializeUser(firebaseUser);
+        } else {
+          setCurrentUser(null);
+          setIsLoggedIn(false);
+        }
+      } finally {
+        setIsInitializingAuth(false);
+        setIsLoggingIn(null);
+      }
+    });
+    return () => unsubAuth();
+  }, []);
+
+  const handleDemoLogin = async (role: UserRole) => {
+    const demoEmail = role === UserRole.LOSTER ? 'loster@demo.com' : 'helper@demo.com';
+    const demoPassword = 'password123';
+    setIsAuthLoading(true);
+    setIsLoggingIn(role);
+    setAuthError(null);
+    try {
+      try {
+        const res = await signInWithEmailAndPassword(auth, demoEmail, demoPassword);
+        await initializeUser(res.user, role);
+      } catch (error: any) {
+        if (error.code === 'auth/user-not-found' || error.code === 'auth/invalid-email' || error.code === 'auth/invalid-credential' || error.code === 'auth/wrong-password') {
+          const res = await createUserWithEmailAndPassword(auth, demoEmail, demoPassword);
+          await initializeUser(res.user, role);
+        } else {
+          throw error;
+        }
+      }
+    } catch (error: any) {
+      console.error("Demo login error:", error);
+      if (error.code === 'auth/operation-not-allowed') {
+        setAuthError("Email/Password Auth is not enabled in Firebase Console. Please enable it to use fixed demo accounts.");
+      } else {
+        setAuthError("Demo account initialization failed.");
+      }
+    } finally {
+      setIsAuthLoading(false);
+      setIsLoggingIn(null);
+    }
+  };
+
+  useEffect(() => {
+    if (!isLoggedIn || !currentUser) return;
+    const unsubPublicQuests = onSnapshot(query(collection(db, 'quests'), where('status', '==', 'ACTIVE')), (snapshot) => {
+      setPublicQuests(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }) as Quest));
+    }, (error) => handleFirestoreError(error, OperationType.LIST, 'quests/public'));
+
+    const unsubOwnedQuests = onSnapshot(query(collection(db, 'quests'), where('ownerId', '==', currentUser.id)), (snapshot) => {
+      setOwnedQuests(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }) as Quest));
+    }, (error) => handleFirestoreError(error, OperationType.LIST, 'quests/owned'));
+
+    const unsubJoinedQuests = onSnapshot(query(collection(db, 'quests'), where('helperIds', 'array-contains', currentUser.id)), (snapshot) => {
+      setJoinedQuests(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }) as Quest));
+    }, (error) => handleFirestoreError(error, OperationType.LIST, 'quests/joined'));
+    
+    const unsubNotifs = onSnapshot(query(collection(db, 'notifications'), where('userId', '==', currentUser.id)), (snapshot) => {
+      setNotifications(snapshot.docs.map(d => ({ id: d.id, ...d.data() }) as Notification).sort((a,b)=>b.timestamp-a.timestamp));
+    }, (error) => handleFirestoreError(error, OperationType.LIST, 'notifications'));
+    
+    const unsubHelperClaims = onSnapshot(query(collection(db, 'claims'), where('helperId', '==', currentUser.id)), (snapshot) => {
+      const c = snapshot.docs.map(d => ({ id: d.id, ...d.data() }) as FoundItemClaim);
+      setClaims(prev => {
+        const other = prev.filter(p => !c.find(newC => newC.id === p.id) && p.helperId !== currentUser.id);
+        return [...other, ...c];
+      });
+    }, (error) => handleFirestoreError(error, OperationType.LIST, 'claims/helper'));
+
+    const unsubOwnerClaims = onSnapshot(query(collection(db, 'claims'), where('questOwnerId', '==', currentUser.id)), (snapshot) => {
+      const c = snapshot.docs.map(d => ({ id: d.id, ...d.data() }) as FoundItemClaim);
+      setClaims(prev => {
+        const other = prev.filter(p => !c.find(newC => newC.id === p.id) && p.questOwnerId !== currentUser.id);
+        return [...other, ...c];
+      });
+    }, (error) => handleFirestoreError(error, OperationType.LIST, 'claims/owner'));
+
+    // Keep user record in sync (especially role across devices)
+    const unsubUser = onSnapshot(doc(db, 'users', currentUser.id), (docSnap) => {
+      if (docSnap.exists()) {
+        const u = docSnap.data() as User;
+        setCurrentUser(u);
+        if (u.role) setActiveRole(u.role);
+      }
+    });
+
+    return () => { 
+      unsubPublicQuests(); 
+      unsubOwnedQuests(); 
+      unsubJoinedQuests(); 
+      unsubNotifs(); 
+      unsubHelperClaims(); 
+      unsubOwnerClaims();
+      unsubUser(); 
+    };
+  }, [isLoggedIn, currentUser?.id]);
+
+  useEffect(() => {
+    if (!selectedQuestId || !isLoggedIn) {
+      setMessages([]);
+      return;
+    }
+    const unsubMessages = onSnapshot(query(collection(db, 'quests', selectedQuestId, 'messages')), (snapshot) => {
+      const msgs = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Message)).sort((a,b)=>a.timestamp-b.timestamp);
+      setMessages(msgs);
+    }, (error) => handleFirestoreError(error, OperationType.LIST, `quests/${selectedQuestId}/messages`));
+    return () => {
+      unsubMessages();
+      setMessages([]);
+    };
+  }, [selectedQuestId]);
 
   const googleMapsOptions = useMemo(() => ({
     id: 'google-map-script',
@@ -153,8 +378,7 @@ export default function App() {
 
   const { isLoaded, loadError } = useJsApiLoader(googleMapsOptions);
 
-  const mapsApiKeyMissing = !((import.meta as any).env.VITE_GOOGLE_MAPS_API_KEY) || 
-                            (import.meta as any).env.VITE_GOOGLE_MAPS_API_KEY === 'MY_GOOGLE_MAPS_API_KEY' ||
+  const mapsApiKeyMissing = !(import.meta as any).env.VITE_GOOGLE_MAPS_API_KEY || 
                             (import.meta as any).env.VITE_GOOGLE_MAPS_API_KEY.trim() === '';
 
   // Address Autocomplete State
@@ -162,12 +386,13 @@ export default function App() {
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [mapCenter, setMapCenter] = useState({ lat: 31.5204, lng: 74.3587 }); // Lahore, Pakistan
   const [userLocation, setUserLocation] = useState<{ lat: number, lng: number } | null>(null);
+  const [cityName, setCityName] = useState<string>('Detecting...');
 
   useEffect(() => {
-    if (activeRole === UserRole.HELPER && !userLocation && isLoaded) {
+    if (!userLocation && isLoaded) {
       detectLocation();
     }
-  }, [activeRole, isLoaded]);
+  }, [isLoaded]);
 
   useEffect(() => {
     if (darkMode) {
@@ -179,9 +404,48 @@ export default function App() {
     }
   }, [darkMode]);
 
-  if (!isLoggedIn) {
+  if (isInitializingAuth || firestoreReady === 'loading') {
     return (
-      <div className="min-h-screen bg-[#fff9f7] flex flex-col items-center justify-center p-6 text-slate-800 font-sans">
+      <div className="min-h-screen bg-[#fff9f7] flex flex-col items-center justify-center p-6 text-slate-800">
+         <div className="w-16 h-16 border-4 border-orange-500 border-t-transparent rounded-full animate-spin"></div>
+         <p className="mt-4 text-orange-500 font-bold uppercase tracking-widest text-sm">Initializing PakFound...</p>
+         {firestoreReady === 'loading' && <p className="mt-2 text-slate-400 text-[10px] font-bold">Checking database connection...</p>}
+      </div>
+    );
+  }
+
+  if (firestoreReady === 'error') {
+    return (
+      <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center p-8 text-center text-white font-sans">
+        <div className="w-24 h-24 bg-red-500/20 rounded-[2.5rem] flex items-center justify-center mb-8 border border-red-500/30">
+          <AlertCircle className="w-12 h-12 text-red-500 animate-pulse" />
+        </div>
+        <h1 className="text-3xl font-black italic mb-4 uppercase tracking-tight">Connectivity Issue</h1>
+        <p className="text-slate-400 max-w-sm text-sm leading-relaxed mb-10 font-bold">
+          We're having trouble reaching the PakFound network. This might be due to a temporary maintenance or a network firewall.
+        </p>
+        <button 
+          onClick={() => window.location.reload()}
+          className="px-10 py-4 bg-orange-600 hover:bg-orange-500 text-white rounded-2xl font-black italic uppercase tracking-widest transition-all shadow-xl shadow-orange-900/20 active:scale-95"
+        >
+          RECONNECT NOW
+        </button>
+        <p className="mt-8 text-[10px] text-slate-500 uppercase tracking-widest font-black italic">
+          Pakistan's Trust Network • Beta
+        </p>
+      </div>
+    );
+  }  if (!isLoggedIn || !currentUser) {
+    return (
+      <div className="min-h-screen bg-[#fff9f7] flex flex-col items-center justify-center p-6 text-slate-800 font-sans relative">
+        {(isLoggingIn || isAuthLoading) && (
+          <div className="absolute inset-0 bg-white/80 backdrop-blur-sm z-50 flex flex-col items-center justify-center">
+             <div className="w-16 h-16 border-4 border-orange-500 border-t-transparent rounded-full animate-spin mb-4"></div>
+             <p className="text-orange-600 font-black italic uppercase tracking-widest text-sm animate-pulse px-8 text-center text-balance">
+                Connecting to PakFound Network...
+             </p>
+          </div>
+        )}
         <motion.div 
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
@@ -192,39 +456,55 @@ export default function App() {
               <Compass className="w-10 h-10 text-white" />
             </div>
             <h1 className="text-4xl font-bold tracking-tight text-slate-900 mt-6">PakFound</h1>
-            <p className="text-slate-500 text-base font-medium max-w-[280px] mx-auto">Helping our neighbors in Pakistan find what they've lost.</p>
+            <p className="text-slate-500 text-base font-medium max-w-[280px] mx-auto">Pakistan's most trusted network for finding lost valuables.</p>
           </div>
 
           <div className="space-y-4">
             <div className="bg-white p-8 rounded-[2.5rem] border border-orange-100 shadow-sm">
-              <h3 className="text-xs font-bold uppercase tracking-widest text-slate-400 mb-8 font-display">Who are you today?</h3>
-              <div className="space-y-4">
-                <button 
-                  onClick={() => {
-                    setCurrentUser(MOCK_USERS[0]);
-                    setActiveRole(UserRole.LOSTER);
-                    setIsLoggedIn(true);
-                  }}
-                  className="w-full py-4 bg-orange-500 hover:bg-orange-600 text-white rounded-2xl font-bold flex items-center justify-center gap-3 transition-all shadow-md shadow-orange-100 active:scale-95"
-                >
-                  <Search className="w-5 h-5" />
-                  I LOST SOMETHING
-                </button>
-                <button 
-                  onClick={() => {
-                    setCurrentUser(MOCK_USERS[1]);
-                    setActiveRole(UserRole.HELPER);
-                    setIsLoggedIn(true);
-                  }}
-                  className="w-full py-4 bg-slate-900 hover:bg-slate-800 text-white rounded-2xl font-bold flex items-center justify-center gap-3 transition-all shadow-md shadow-slate-200 active:scale-95"
-                >
-                  <Zap className="w-5 h-5" />
-                  I WANT TO HELP
-                </button>
+              
+              {true && (
+                <div className="space-y-6">
+                  <h3 className="text-xs font-black uppercase tracking-[0.2em] text-slate-400 mb-8 border-b border-slate-50 pb-4">Select Your Demo Experience</h3>
+                  
+                  {authError && (
+                    <div className="mb-6 bg-red-50 border border-red-100 p-4 rounded-2xl flex items-center gap-3 text-left">
+                      <AlertCircle className="w-5 h-5 text-red-500 shrink-0" />
+                      <p className="text-[10px] font-bold text-red-700 leading-relaxed uppercase tracking-widest leading-none">{authError}</p>
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-1 gap-4">
+                    <button 
+                      onClick={() => handleDemoLogin(UserRole.LOSTER)}
+                      className="group relative overflow-hidden w-full py-8 bg-orange-500 hover:bg-orange-600 text-white rounded-[2rem] font-black italic uppercase tracking-[0.2em] text-sm shadow-xl shadow-orange-100 transition-all active:scale-95"
+                    >
+                      <div className="relative z-10 flex flex-col items-center gap-2">
+                        <Compass className="w-8 h-8 group-hover:rotate-12 transition-transform" />
+                        Login as Demo Loster
+                      </div>
+                    </button>
+                    
+                    <button 
+                      onClick={() => handleDemoLogin(UserRole.HELPER)}
+                      className="group relative overflow-hidden w-full py-8 bg-slate-900 hover:bg-slate-800 text-white rounded-[2rem] font-black italic uppercase tracking-[0.2em] text-sm shadow-xl active:scale-95 transition-all"
+                    >
+                      <div className="relative z-10 flex flex-col items-center gap-2">
+                         <ShieldCheck className="w-8 h-8 text-orange-500 group-hover:scale-110 transition-transform" />
+                         Login as Demo Helper
+                      </div>
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <div className="mt-8 pt-6 border-t border-slate-50 italic text-center">
+                <p className="text-[9px] text-slate-400 font-bold uppercase tracking-widest leading-relaxed">
+                   Shared Accounts. Data is <span className="text-orange-500">persistent</span> across all devices.
+                </p>
               </div>
             </div>
             <p className="text-[10px] text-slate-400 font-medium uppercase tracking-widest mt-8">
-              Community Beta • Made for Pakistan
+              Community Demo • PakFound v2.0
             </p>
           </div>
         </motion.div>
@@ -232,24 +512,39 @@ export default function App() {
     );
   }
 
-  const detectLocation = () => {
+  function detectLocation() {
     if (!navigator.geolocation) {
-      alert("Geolocation is not supported by your browser");
+      setCityName('Local');
       return;
     }
 
     navigator.geolocation.getCurrentPosition(
       (position) => {
         const { latitude, longitude } = position.coords;
-        // In a real app we'd reverse geocode this. For now, we'll simulate the update.
+        if (window.google && window.google.maps) {
+          const geocoder = new window.google.maps.Geocoder();
+          geocoder.geocode({ location: { lat: latitude, lng: longitude } }, (results, status) => {
+            if (status === 'OK' && results && results[0]) {
+              const addressComponents = results[0].address_components;
+              const cityResult = addressComponents.find(c => c.types.includes('locality')) || addressComponents.find(c => c.types.includes('administrative_area_level_2'));
+              if (cityResult) {
+                setCityName(cityResult.short_name);
+              } else {
+                setCityName('Local');
+              }
+            } else {
+              setCityName('Local');
+            }
+          });
+        }
+        
         setSearchQuery("Current Location: Detected");
-        addNotification('SYSTEM', 'global', "Precision GPS locked. Updating local recovery grid.");
         // Center the map and mark user location
         setMapCenter({ lat: latitude, lng: longitude });
         setUserLocation({ lat: latitude, lng: longitude });
       },
       () => {
-        alert("Unable to retrieve your location. Check permissions.");
+        setCityName('Local');
       },
       { enableHighAccuracy: true }
     );
@@ -290,86 +585,178 @@ export default function App() {
   // Notifications logic
   const unreadCount = notifications.filter(n => !n.isRead).length;
 
-  const addNotification = (type: Notification['type'], questId: string, message: string, targetUserId?: string) => {
-    const newNotif: Notification = {
-      id: Math.random().toString(36).substr(2, 9),
+  const addNotification = async (type: Notification['type'], questId: string, message: string, targetUserId?: string) => {
+    if (!currentUser) return;
+    const notif = {
       userId: targetUserId || currentUser.id,
       type,
       questId,
       message,
-      timestamp: Date.now(),
+      timestamp: serverTimestamp(),
       isRead: false
     };
-    setNotifications(prev => [newNotif, ...prev]);
+    try {
+      await addDoc(collection(db, 'notifications'), notif);
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, 'notifications');
+    }
   };
 
   // Helper Functions
-  const joinQuest = (questId: string) => {
-    if (currentUser.joinedQuests.length >= 2) {
+  const joinQuest = async (questId: string) => {
+    if (!currentUser) return;
+    if ((currentUser.joinedQuests || []).length >= 2) {
       alert("Helpers can only join 2 active quests at a time.");
       return;
     }
-    setQuests(prev => prev.map(q => {
-      if (q.id === questId) {
-        return { ...q, helperIds: [...q.helperIds, currentUser.id] };
+    const questRef = doc(db, 'quests', questId);
+    try {
+      const qDoc = await getDoc(questRef);
+      if (qDoc.exists()) {
+        const q = qDoc.data() as Quest;
+        await updateDoc(questRef, { 
+          helperIds: [...(q.helperIds || []), currentUser.id],
+          updatedAt: serverTimestamp()
+        });
+        await addNotification('HELPER_JOINED', questId, `${currentUser.name} joined to help you out!`, q.ownerId);
       }
-      return q;
-    }));
-    setCurrentUser(prev => ({ ...prev, joinedQuests: [...prev.joinedQuests, questId] }));
-    addNotification('HELPER_JOINED', questId, "You've successfully joined the quest!");
-    setSelectedQuestId(questId);
-    setCurrentPage('CHAT');
+      const userRef = doc(db, 'users', currentUser.id);
+      await updateDoc(userRef, { joinedQuests: [...(currentUser.joinedQuests || []), questId] });
+      
+      await addNotification('HELPER_JOINED', questId, "You've successfully joined the quest!", currentUser.id);
+      setSelectedQuestId(questId);
+      setCurrentPage('CHAT');
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, `quests/${questId}/join`);
+    }
   };
 
   const handleCloseQuest = async (questId: string, reason: string) => {
     const quest = quests.find(q => q.id === questId);
     if (!quest) return;
 
-    // AI Enhance the reason
-    const enhanced = await enhanceClosureReason(reason);
+    try {
+      // AI Enhance the reason
+      const enhanced = await enhanceClosureReason(reason);
 
-    // Update quest status
-    setQuests(prev => prev.map(q => q.id === questId ? { ...q, status: QuestStatus.COMPLETED, closureReason: enhanced } : q));
-    
-    // Notify all helpers
-    quest.helperIds.forEach(hid => {
-      addNotification('QUEST_CLOSED', questId, `Quest "${quest.title}" was closed: ${enhanced}`, hid);
-    });
+      // Update quest status
+      const questRef = doc(db, 'quests', questId);
+      await updateDoc(questRef, { 
+        status: QuestStatus.COMPLETED, 
+        closureReason: enhanced,
+        updatedAt: serverTimestamp()
+      });
+      
+      // Notify all helpers
+      if (quest.helperIds) {
+        for (const hid of quest.helperIds) {
+          await addNotification('QUEST_CLOSED', questId, `Quest "${quest.title}" was closed: ${enhanced}`, hid);
+        }
+      }
 
-    setShowCloseModal(false);
-    setSelectedQuestId(null);
-    setCurrentPage('DASHBOARD');
+      setShowCloseModal(false);
+      setSelectedQuestId(null);
+      setCurrentPage('DASHBOARD');
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, `quests/${questId}`);
+    }
   };
 
   const publishQuest = async (newQuest: Partial<Quest>) => {
-    const quest: Quest = {
-      id: `q${Math.random().toString(36).substr(2, 5)}`,
-      ownerId: currentUser.id,
-      title: newQuest.title || '',
-      category: newQuest.category || 'Others',
-      description: newQuest.description || '',
-      images: newQuest.images || [],
-      rewardAmount: newQuest.rewardAmount || 50,
-      status: QuestStatus.ACTIVE,
-      locations: newQuest.locations || [],
-      createdAt: Date.now(),
-      helperIds: [],
-      ...newQuest
-    };
-    
-    // AI Insights (Simulated for speed, but using real Gemini Service)
-    const insights = await getQuestAIInsights(quest.title, quest.description, quest.category);
-    quest.aiRecoverySuggestions = insights;
+    if (!currentUser) return;
+    setIsPublishing(true);
+    try {
+      const questData: any = {
+        ownerId: currentUser.id,
+        title: newQuest.title || '',
+        category: newQuest.category || 'Others',
+        description: newQuest.description || '',
+        images: newQuest.images || [],
+        rewardAmount: newQuest.rewardAmount || 50,
+        status: QuestStatus.ACTIVE,
+        locations: newQuest.locations || [],
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        helperIds: [],
+        ...newQuest
+      };
+      
+      const insights = await getQuestAIInsights(questData.title, questData.description, questData.category);
+      questData.aiRecoverySuggestions = insights;
 
-    setQuests([quest, ...quests]);
-    setCurrentUser(prev => ({ ...prev, activeQuests: [...prev.activeQuests, quest.id] }));
-    
-    if (quest.locations.length > 0) {
-      setMapCenter({ lat: quest.locations[0].lat, lng: quest.locations[0].lng });
+      const questRef = await addDoc(collection(db, 'quests'), questData);
+      
+      const userRef = doc(db, 'users', currentUser.id);
+      await updateDoc(userRef, { activeQuests: [...(currentUser.activeQuests || []), questRef.id] });
+      
+      if (questData.locations && questData.locations.length > 0) {
+        setMapCenter({ lat: questData.locations[0].lat, lng: questData.locations[0].lng });
+      }
+
+      await addNotification('SYSTEM', questRef.id, `Item "${questData.title}" is now live in the network.`, currentUser.id);
+      setCurrentPage('DASHBOARD');
+    } catch (e) {
+      handleFirestoreError(e, OperationType.WRITE, 'quests');
+    } finally {
+      setIsPublishing(false);
     }
+  };
 
-    addNotification('SYSTEM', quest.id, `Item "${quest.title}" is now live in the network.`);
-    setCurrentPage('DASHBOARD');
+  const handleApproveClaim = async (claimId: string) => {
+    const claim = claims.find(c => c.id === claimId);
+    if (!claim || !currentUser) return;
+    
+    try {
+      await updateDoc(doc(db, 'claims', claimId), { 
+        status: 'APPROVED',
+        updatedAt: serverTimestamp()
+      });
+      await updateDoc(doc(db, 'quests', claim.questId), { 
+        status: QuestStatus.COMPLETED,
+        updatedAt: serverTimestamp()
+      });
+      
+      // Update wallet if it was a real monetary system (mocking for now)
+      // notify helper
+      await addNotification('ADMIN_APPROVED', claim.questId, "Your finding has been approved by the neighbor! The reward is yours.", claim.helperId);
+      alert("Claim Approved! Reward has been transferred to the neighbor.");
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, `claims/${claimId}`);
+    }
+  };
+
+  const handleRejectClaim = async (claimId: string) => {
+    const claim = claims.find(c => c.id === claimId);
+    if (!claim) return;
+    
+    try {
+      await updateDoc(doc(db, 'claims', claimId), { 
+        status: 'REJECTED',
+        updatedAt: serverTimestamp()
+      });
+      // Re-activate quest if it was under review
+      await updateDoc(doc(db, 'quests', claim.questId), { 
+        status: QuestStatus.ACTIVE,
+        updatedAt: serverTimestamp()
+      });
+      await addNotification('SYSTEM', claim.questId, "Your claim was declined by the owner. Keep looking!", claim.helperId);
+      alert("Claim Declined. Neighbor has been notified.");
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, `claims/${claimId}`);
+    }
+  };
+
+  const toggleRole = async () => {
+    if (!currentUser) return;
+    const newRole = activeRole === UserRole.LOSTER ? UserRole.HELPER : UserRole.LOSTER;
+    try {
+      await updateDoc(doc(db, 'users', currentUser.id), { role: newRole });
+      setActiveRole(newRole);
+      setCurrentUser(prev => prev ? { ...prev, role: newRole } : null);
+      setCurrentPage('DASHBOARD');
+    } catch (error) {
+      handleFirestoreError(error, OperationType.WRITE, `users/${currentUser.id}`);
+    }
   };
 
   // Views
@@ -378,9 +765,12 @@ export default function App() {
       return <LosterDashboard 
         user={currentUser} 
         quests={quests.filter(q => q.ownerId === currentUser.id)} 
+        allClaims={claims}
         onAddClick={() => setCurrentPage('ADD_QUEST')}
         onQuestClick={(id) => { setSelectedQuestId(id); setCurrentPage('QUEST_DETAIL'); }}
         onChatClick={(id) => { setSelectedQuestId(id); setCurrentPage('CHAT'); }}
+        onApproveClaim={handleApproveClaim}
+        onRejectClaim={handleRejectClaim}
       />;
     }
     return <HelperDashboard 
@@ -404,17 +794,24 @@ export default function App() {
   const currentQuest = selectedQuestId ? quests.find(q => q.id === selectedQuestId) : null;
 
   return (
-    <div className="flex flex-col h-screen bg-slate-50 font-sans text-slate-900 overflow-hidden">
+    <div className={`flex flex-col h-screen bg-slate-50 font-sans text-slate-900 overflow-hidden transition-colors ${darkMode ? 'dark text-white' : ''}`}>
+      {isPublishing && (
+        <div className="fixed inset-0 bg-slate-900/80 backdrop-blur-md z-[200] flex flex-col items-center justify-center">
+           <div className="w-20 h-20 border-4 border-orange-500 border-t-transparent rounded-full animate-spin shadow-xl"></div>
+           <p className="mt-8 text-white font-black italic uppercase tracking-widest text-xl animate-pulse drop-shadow-md">Publishing Quest...</p>
+           <p className="text-orange-200 mt-2 text-sm font-bold drop-shadow-sm">Summoning community helpers...</p>
+        </div>
+      )}
       {/* Header */}
       <Header 
         user={currentUser} 
         activeRole={activeRole} 
         unreadCount={unreadCount} 
-        onSwitchRole={() => setActiveRole(activeRole === UserRole.LOSTER ? UserRole.HELPER : UserRole.LOSTER)}
         showNotifs={showNotifs}
         onToggleNotifs={() => setShowNotifs(!showNotifs)}
         darkMode={darkMode}
         onToggleDarkMode={() => setDarkMode(!darkMode)}
+        cityName={cityName}
       />
 
       {/* Main Content Area */}
@@ -455,11 +852,12 @@ export default function App() {
             )}
 
             {currentPage === 'MAP' && (
-              <motion.div key="map" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="h-[70vh] lg:h-[80vh] rounded-[3rem] overflow-hidden shadow-2xl border-4 border-white mb-32">
+              <motion.div key="map" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="h-[70vh] lg:h-[80vh] rounded-[3rem] overflow-hidden shadow-2xl border-4 border-white mb-32 flex flex-col">
                  <FullMapView 
                    isLoaded={isLoaded}
                    quests={quests.filter(q => q.ownerId !== currentUser.id && q.status === QuestStatus.ACTIVE)}
                    onQuestClick={(id: string) => { setSelectedQuestId(id); setCurrentPage('QUEST_DETAIL'); }}
+                   onJoinQuest={joinQuest}
                    searchQuery={searchQuery}
                    onSearch={handleSearch}
                    onSelectSuggestion={onSelectSuggestion}
@@ -467,6 +865,7 @@ export default function App() {
                    onDetectLocation={detectLocation}
                    mapCenter={mapCenter}
                    userLocation={userLocation}
+                   hoveredQuestId={null}
                  />
               </motion.div>
             )}
@@ -507,20 +906,64 @@ export default function App() {
                       quest={quests.find(q => q.id === selectedQuestId)!} 
                       user={currentUser} 
                       messages={messages.filter(m => m.questId === selectedQuestId)}
-                      onSendMessage={(txt: string, img?: string) => {
-                        const msg: Message = {
-                          id: Math.random().toString(),
+                      onSendMessage={async (txt: string, img?: string) => {
+                        if (!selectedQuestId) return;
+                        const msg = {
                           questId: selectedQuestId,
                           senderId: currentUser.id,
                           senderName: currentUser.name,
                           text: txt,
-                          imageUrl: img,
-                          timestamp: Date.now()
+                          imageUrl: img || null,
+                          timestamp: serverTimestamp()
                         };
-                        setMessages([...messages, msg]);
+                        try {
+                          await addDoc(collection(db, 'quests', selectedQuestId, 'messages'), msg);
+                        } catch (error) {
+                          handleFirestoreError(error, OperationType.WRITE, `quests/${selectedQuestId}/messages`);
+                        }
                       }}
                       onBack={() => { setSelectedQuestId(null); setCurrentPage('CHAT'); }}
-                      onFoundIt={() => setShowClaimForm(true)}
+                      onFoundIt={() => {
+                        setClaimImages([]);
+                        setClaimCondition('');
+                        setClaimLocation(null);
+                        setClaimDistance(null);
+                        setShowClaimForm(true);
+                        
+                        // Start location detection automatically
+                        setIsVerifyingLocation(true);
+                        if (navigator.geolocation) {
+                          navigator.geolocation.getCurrentPosition((pos) => {
+                            const { latitude, longitude } = pos.coords;
+                            const quest = quests.find(q => q.id === selectedQuestId);
+                            if (quest && quest.locations && quest.locations.length > 0) {
+                              // Find minimum distance to any of the quest's defined locations
+                              let minDist = Infinity;
+                              quest.locations.forEach(loc => {
+                                const d = calculateDistance(latitude, longitude, loc.lat, loc.lng);
+                                if (d < minDist) minDist = d;
+                              });
+                              
+                              setClaimDistance(minDist);
+                              setClaimLocation({ lat: latitude, lng: longitude, address: "Detected Location" });
+                              
+                              // Reverse geocode if possible
+                              if (window.google && window.google.maps) {
+                                const geocoder = new window.google.maps.Geocoder();
+                                geocoder.geocode({ location: { lat: latitude, lng: longitude } }, (results) => {
+                                  if (results && results[0]) {
+                                    setClaimLocation({ lat: latitude, lng: longitude, address: results[0].formatted_address });
+                                  }
+                                });
+                              }
+                            }
+                            setIsVerifyingLocation(false);
+                          }, () => {
+                            setIsVerifyingLocation(false);
+                            alert("Location access is required to verify your claim. Please enable GPS.");
+                          }, { enableHighAccuracy: true });
+                        }
+                      }}
                       onCloseQuest={() => { setClosingQuestId(selectedQuestId); setShowCloseModal(true); }}
                       role={activeRole}
                     />
@@ -558,7 +1001,7 @@ export default function App() {
 
           {currentPage === 'ADD_QUEST' && (
             <motion.div key="add" initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 1.05 }} className="min-h-full">
-              <AddQuestFlow onCancel={() => setCurrentPage('DASHBOARD')} onPublish={publishQuest} isLoaded={isLoaded} />
+              <AddQuestFlow onCancel={() => setCurrentPage('DASHBOARD')} onPublish={publishQuest} isLoaded={isLoaded} isPublishing={isPublishing} />
             </motion.div>
           )}
 
@@ -575,21 +1018,7 @@ export default function App() {
             </motion.div>
           )}
 
-          {currentPage === 'ADMIN' && (
-            <motion.div key="admin" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
-      <AdminPanel 
-        claims={claims} 
-        onApprove={(claimId: string) => {
-          const claim = claims.find(c => c.id === claimId);
-          if (!claim) return;
-          
-          setClaims(prev => prev.map(c => c.id === claimId ? { ...c, status: 'APPROVED' } : c));
-          setQuests(prev => prev.map(q => q.id === claim.questId ? { ...q, status: QuestStatus.COMPLETED } : q));
-          addNotification('ADMIN_APPROVED', claim.questId, "Your finding has been approved by admin!");
-        }}
-      />
-            </motion.div>
-          )}
+
 
             {currentPage === 'PROFILE' && (
               <motion.div key="profile" initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -10 }} className="max-w-2xl mx-auto h-full flex flex-col pb-32">
@@ -603,11 +1032,13 @@ export default function App() {
                     <h2 className="text-3xl font-black italic tracking-tight text-slate-900 dark:text-white">{currentUser.name}</h2>
                     <p className="text-slate-400 dark:text-slate-500 font-bold text-sm tracking-widest mt-1 uppercase">{currentUser.email}</p>
                     
-                    <div className="grid grid-cols-2 gap-6 w-full mt-10">
-                       <div className="bg-slate-50 dark:bg-slate-900/50 p-6 rounded-[2rem] border border-slate-100 dark:border-slate-700 flex flex-col items-center transition-colors">
-                          <span className="text-[10px] font-black text-orange-500 uppercase tracking-[0.2em] mb-2">Wallet</span>
-                          <span className="text-2xl font-black italic tracking-tighter text-slate-900 dark:text-white">${currentUser.walletBalance}</span>
-                       </div>
+                    <div className={`grid ${activeRole === UserRole.HELPER ? 'grid-cols-2' : 'grid-cols-1'} gap-6 w-full mt-10`}>
+                       {activeRole === UserRole.HELPER && (
+                        <div className="bg-slate-50 dark:bg-slate-900/50 p-6 rounded-[2rem] border border-slate-100 dark:border-slate-700 flex flex-col items-center transition-colors">
+                            <span className="text-[10px] font-black text-orange-500 uppercase tracking-[0.2em] mb-2">Wallet</span>
+                            <span className="text-2xl font-black italic tracking-tighter text-slate-900 dark:text-white text-balance">${currentUser.walletBalance}</span>
+                        </div>
+                       )}
                        <div className="bg-slate-50 dark:bg-slate-900/50 p-6 rounded-[2rem] border border-slate-100 dark:border-slate-700 flex flex-col items-center transition-colors">
                           <span className="text-[10px] font-black text-blue-500 uppercase tracking-[0.2em] mb-2">Rating</span>
                           <span className="text-2xl font-black italic tracking-tighter text-slate-900 dark:text-white">★ {currentUser.rating}</span>
@@ -615,6 +1046,13 @@ export default function App() {
                     </div>
 
                     <div className="w-full mt-12 space-y-3">
+                      <button 
+                        onClick={toggleRole}
+                        className="w-full flex justify-between items-center px-8 py-5 bg-orange-500 text-white border border-orange-500 hover:bg-orange-600 active:scale-95 transition-all text-sm font-black italic uppercase tracking-widest"
+                      >
+                         Switch to {activeRole === UserRole.LOSTER ? 'Helper' : 'Loster'} Mode
+                         <RefreshCw className="w-4 h-4 text-white" />
+                      </button>
                       {['Security Hub', 'Payout Methods', 'Preferences', 'Help Center'].map(item => (
                         <button key={item} className="w-full flex justify-between items-center px-8 py-5 bg-white dark:bg-slate-900 border border-slate-50 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800 hover:border-slate-200 dark:hover:border-slate-700 active:scale-95 transition-all text-sm font-black italic uppercase tracking-widest text-slate-600 dark:text-slate-400">
                            {item}
@@ -622,7 +1060,8 @@ export default function App() {
                         </button>
                       ))}
                       <button 
-                        onClick={() => {
+                        onClick={async () => {
+                          await signOut(auth);
                           setIsLoggedIn(false);
                           setCurrentPage('DASHBOARD');
                         }}
@@ -636,48 +1075,154 @@ export default function App() {
             )}
 
           {showClaimForm && currentQuest && (
-            <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} className="fixed inset-0 bg-white z-[200] overflow-y-auto p-6 flex flex-col font-sans">
-                <div className="flex justify-between items-center mb-6">
-                    <h2 className="text-xl font-black italic">Found Item Claim</h2>
-                    <button onClick={() => setShowClaimForm(false)} className="p-2 bg-slate-100 rounded-full"><X className="w-6 h-6" /></button>
-                </div>
-                <ExplainerPanel 
-                title="Security Checkpoint" 
-                description="When a helper finds an item, they must submit photo evidence and their exact location. System verifies if they are within the lost radius."
-                badge="Integrity"
-                />
-                <div className="flex-1 space-y-6">
-                    <div className="aspect-video bg-slate-100 rounded-2xl flex flex-col items-center justify-center border-2 border-dashed border-slate-200">
-                        <Camera className="w-8 h-8 text-slate-300" />
-                        <span className="text-[10px] font-bold text-slate-400 mt-2">UPLOAD EVIDENCE PHOTOS</span>
+            <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="fixed inset-0 bg-slate-900/60 backdrop-blur-sm z-[200] flex items-center justify-center p-4">
+              <motion.div 
+                initial={{ opacity: 0, scale: 0.9, y: 20 }} 
+                animate={{ opacity: 1, scale: 1, y: 0 }} 
+                className="bg-white dark:bg-slate-900 w-full max-w-lg rounded-[2.5rem] shadow-2xl border border-slate-100 dark:border-slate-800 overflow-hidden flex flex-col max-h-[90vh]"
+              >
+                <div className="p-8 border-b border-slate-50 dark:border-slate-800 flex justify-between items-center shrink-0">
+                    <div>
+                      <h2 className="text-2xl font-black italic text-slate-900 dark:text-white uppercase tracking-tight">Found Item Claim</h2>
+                      <p className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest mt-1">Quest: {currentQuest.title}</p>
                     </div>
+                    <button onClick={() => setShowClaimForm(false)} className="w-10 h-10 bg-slate-100 dark:bg-slate-800 rounded-full flex items-center justify-center text-slate-400 hover:rotate-90 transition-transform"><X className="w-5 h-5" /></button>
+                </div>
+
+                <div className="flex-1 overflow-y-auto p-8 space-y-8 custom-scrollbar">
+                    <ExplainerPanel 
+                      title="Proximity Verification" 
+                      description="To protect against false claims, we check your real-time distance from the item's last known location. You must be within 500 meters."
+                      badge="Security"
+                    />
+
                     <div className="space-y-4">
-                        <input placeholder="Current Condition (e.g. Scratched, Clean)" className="w-full bg-white border border-slate-200 rounded-xl px-4 py-3 text-sm" />
-                        <div className="flex items-center gap-2 bg-green-50 p-3 rounded-xl">
-                            <CheckCircle2 className="w-4 h-4 text-green-600" />
-                            <span className="text-xs font-bold text-green-700">Location Verified: Bethesda terrace</span>
+                      <div className="flex items-center justify-between">
+                         <h3 className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] ml-1">Location Status</h3>
+                         {isVerifyingLocation && <RefreshCw className="w-3 h-3 text-orange-500 animate-spin" />}
+                      </div>
+                      
+                      {isVerifyingLocation ? (
+                        <div className="p-6 bg-slate-50 dark:bg-slate-800/50 rounded-2xl border border-dashed border-slate-200 dark:border-slate-700 flex flex-col items-center gap-3">
+                           <MapPin className="w-6 h-6 text-orange-500 animate-bounce" />
+                           <p className="text-[10px] font-bold text-slate-500 dark:text-slate-400">Pinging GPS Satellites...</p>
                         </div>
+                      ) : (
+                        <div className={`p-6 rounded-2xl border flex items-center gap-4 transition-all ${claimDistance !== null && claimDistance <= 500 ? 'bg-green-50 border-green-100' : 'bg-red-50 border-red-100'}`}>
+                           <div className={`w-12 h-12 rounded-xl flex items-center justify-center shrink-0 ${claimDistance !== null && claimDistance <= 500 ? 'bg-green-500 text-white' : 'bg-red-500 text-white'}`}>
+                              {claimDistance !== null && claimDistance <= 500 ? <CheckCircle2 className="w-6 h-6" /> : <AlertCircle className="w-6 h-6" />}
+                           </div>
+                           <div className="flex-1 min-w-0">
+                              <p className={`text-[10px] font-black uppercase tracking-widest ${claimDistance !== null && claimDistance <= 500 ? 'text-green-600' : 'text-red-600'}`}>
+                                {claimDistance !== null && claimDistance <= 500 ? 'Verified: Within Radius' : 'Error: Outside Radius'}
+                              </p>
+                              <p className="text-xs font-bold text-slate-700 dark:text-slate-300 truncate mt-1">{claimLocation?.address || 'Current Location undetected'}</p>
+                              {claimDistance !== null && (
+                                <p className="text-[9px] font-medium text-slate-400 mt-0.5">Distance: {Math.round(claimDistance)}m from target</p>
+                              )}
+                           </div>
+                           {claimDistance !== null && claimDistance > 500 && (
+                             <button onClick={() => {
+                               setIsVerifyingLocation(true);
+                               navigator.geolocation.getCurrentPosition((pos) => {
+                                 const { latitude, longitude } = pos.coords;
+                                 let minDist = Infinity;
+                                 currentQuest.locations.forEach((loc: any) => {
+                                   const d = calculateDistance(latitude, longitude, loc.lat, loc.lng);
+                                   if (d < minDist) minDist = d;
+                                 });
+                                 setClaimDistance(minDist);
+                                 setClaimLocation({ lat: latitude, lng: longitude, address: "Retrying..." });
+                                 setIsVerifyingLocation(false);
+                               }, () => setIsVerifyingLocation(false));
+                             }} className="p-2 bg-white rounded-lg text-slate-400 hover:text-orange-500 transition-colors shadow-sm"><RefreshCw className="w-4 h-4" /></button>
+                           )}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="space-y-4">
+                      <div className="flex items-center justify-between">
+                         <h3 className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] ml-1">Photo Evidence (Max 2)</h3>
+                         <span className="text-[10px] font-bold text-slate-400">{claimImages.length}/2</span>
+                      </div>
+                      <div className="grid grid-cols-2 gap-4">
+                        {claimImages.map((img, i) => (
+                          <div key={i} className="aspect-square rounded-2xl overflow-hidden relative group border-2 border-white dark:border-slate-800 shadow-lg">
+                            <img src={img} className="w-full h-full object-cover" />
+                            <button onClick={() => setClaimImages(prev => prev.filter((_, idx) => idx !== i))} className="absolute top-2 right-2 w-7 h-7 bg-red-500 text-white rounded-full flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"><X className="w-4 h-4" /></button>
+                          </div>
+                        ))}
+                        {claimImages.length < 2 && (
+                          <label className="aspect-square rounded-2xl bg-slate-50 dark:bg-slate-800 border-2 border-dashed border-slate-200 dark:border-slate-700 flex flex-col items-center justify-center cursor-pointer hover:border-orange-300 transition-all group">
+                             <Camera className="w-6 h-6 text-slate-300 group-hover:text-orange-400 transition-colors" />
+                             <span className="text-[9px] font-black text-slate-400 mt-2 uppercase">Add Evidence</span>
+                             <input type="file" className="hidden" accept="image/*" onChange={async (e) => {
+                               const file = e.target.files?.[0];
+                               if (!file) return;
+                               const reader = new FileReader();
+                               reader.onload = async (rv) => {
+                                 const base64 = rv.target?.result as string;
+                                 const res = await moderateImage(base64);
+                                 if (res.isSafe) {
+                                   setClaimImages(prev => [...prev, base64]);
+                                 } else {
+                                   alert(`AI Flagged: ${res.rejectionReason}`);
+                                 }
+                               };
+                               reader.readAsDataURL(file);
+                             }} />
+                          </label>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="space-y-4">
+                        <label className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] ml-1">Current Condition</label>
+                        <textarea 
+                          value={claimCondition}
+                          onChange={(e) => setClaimCondition(e.target.value)}
+                          placeholder="e.g. Clean, dusty, slightly scratched but functional..."
+                          rows={3}
+                          className="w-full bg-slate-50 dark:bg-slate-800 border border-slate-100 dark:border-slate-700 rounded-2xl px-6 py-4 text-sm font-bold focus:bg-white focus:border-orange-500 outline-none transition-all shadow-sm resize-none dark:text-white"
+                        />
                     </div>
                 </div>
-                <button 
-                onClick={() => {
-                    const newClaim: FoundItemClaim = {
-                        id: `c${Date.now()}`,
-                        questId: currentQuest.id,
-                        helperId: currentUser.id,
-                        evidenceImages: [],
-                        foundLocation: { lat: 40.7738, lng: -73.9708, address: 'Bethesda Terrace' },
-                        condition: 'Good',
-                        status: 'PENDING'
-                    };
-                    setClaims([...claims, newClaim]);
-                    setShowClaimForm(false);
-                    addNotification('CLAIM_SUBMITTED', currentQuest.id, "Reward pending admin review.");
-                }}
-                className="w-full py-4 bg-orange-500 text-white rounded-2xl font-black italic shadow-xl shadow-orange-100 mt-6"
-                >
-                    SUBMIT CLAIM
-                </button>
+
+                <div className="p-8 border-t border-slate-50 dark:border-slate-800 shrink-0 bg-white dark:bg-slate-900 transition-colors">
+                  <button 
+                    disabled={claimImages.length === 0 || !claimCondition || claimDistance === null || claimDistance > 500}
+                    onClick={async () => {
+                        const newClaim = {
+                            questId: currentQuest.id,
+                            questOwnerId: currentQuest.ownerId,
+                            helperId: currentUser.id,
+                            helperName: currentUser.name,
+                            evidenceImages: claimImages,
+                            foundLocation: claimLocation,
+                            condition: claimCondition,
+                            status: 'PENDING',
+                            createdAt: serverTimestamp()
+                        };
+                        try {
+                          await addDoc(collection(db, 'claims'), newClaim);
+                          // Update quest status to UNDER_REVIEW
+                          await updateDoc(doc(db, 'quests', currentQuest.id), { status: QuestStatus.UNDER_REVIEW });
+                          
+                          setShowClaimForm(false);
+                          await addNotification('CLAIM_SUBMITTED', currentQuest.id, `Claim submitted for "${currentQuest.title}". Awaiting neighbor approval.`, currentUser.id);
+                          await addNotification('CLAIM_SUBMITTED', currentQuest.id, `${currentUser.name} claims to have found your item! Review the evidence now.`, currentQuest.ownerId);
+                          setCurrentPage('DASHBOARD');
+                        } catch (error) {
+                          handleFirestoreError(error, OperationType.WRITE, 'claims');
+                        }
+                    }}
+                    className="w-full py-5 bg-orange-500 hover:bg-orange-600 disabled:opacity-50 disabled:grayscale text-white rounded-2xl font-black italic uppercase tracking-[0.2em] text-sm shadow-xl shadow-orange-100 dark:shadow-none active:scale-95 transition-all"
+                  >
+                      {claimDistance !== null && claimDistance > 500 ? 'OUTSIDE RADIUS (MIN 500m)' : 'TRANSMIT CLAIM'}
+                  </button>
+                </div>
+              </motion.div>
             </motion.div>
           )}
         </AnimatePresence>
@@ -712,18 +1257,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Admin Switcher for Reviewer Convenience */}
-      <div className="fixed bottom-24 right-4 z-[100]">
-         <button 
-           onClick={() => setCurrentPage('ADMIN')}
-           className="w-12 h-12 bg-indigo-600 text-white rounded-full flex items-center justify-center shadow-lg hover:scale-105 transition-transform"
-         >
-           <ShieldCheck className="w-6 h-6" />
-         </button>
-         <div className="absolute -top-12 right-0 bg-indigo-100 text-indigo-700 text-[10px] font-bold px-2 py-1 rounded whitespace-nowrap">
-            JUDGE VIEW: ADMIN
-         </div>
-      </div>
+
 
       {showCloseModal && closingQuestId && (
         <QuestClosureModal 
@@ -791,7 +1325,7 @@ function QuestClosureModal({ onConfirm, onCancel }: { onConfirm: (reason: string
 
 // --- Sub-Components ---
 
-function Header({ user, activeRole, unreadCount, onSwitchRole, showNotifs, onToggleNotifs, darkMode, onToggleDarkMode }: { user: User, activeRole: UserRole, unreadCount: number, onSwitchRole: () => void, showNotifs: boolean, onToggleNotifs: () => void, darkMode: boolean, onToggleDarkMode: () => void }) {
+function Header({ user, activeRole, unreadCount, showNotifs, onToggleNotifs, darkMode, onToggleDarkMode, cityName }: { user: User, activeRole: UserRole, unreadCount: number, showNotifs: boolean, onToggleNotifs: () => void, darkMode: boolean, onToggleDarkMode: () => void, cityName: string }) {
   return (
     <header className="bg-white/80 dark:bg-slate-900/80 backdrop-blur-3xl border-b border-slate-200/50 dark:border-slate-800 px-6 py-4 flex items-center justify-between sticky top-0 z-[60] lg:px-16 lg:py-6 transition-colors">
       <div className="flex items-center gap-5">
@@ -802,7 +1336,7 @@ function Header({ user, activeRole, unreadCount, onSwitchRole, showNotifs, onTog
           <h1 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white leading-none">PakFound</h1>
           <div className="flex items-center gap-2 mt-1">
             <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
-            <p className="text-[10px] font-medium text-slate-500 dark:text-slate-400 tracking-wide uppercase">Community Online</p>
+            <p className="text-[10px] font-medium text-slate-500 dark:text-slate-400 tracking-wide uppercase">Community Online ({activeRole})</p>
           </div>
         </div>
       </div>
@@ -818,22 +1352,18 @@ function Header({ user, activeRole, unreadCount, onSwitchRole, showNotifs, onTog
         <div className="hidden md:flex items-center gap-8 px-6 py-2.5 bg-orange-50/50 dark:bg-slate-800/50 backdrop-blur-xl rounded-2xl border border-orange-100 dark:border-slate-700 shadow-sm">
            <div className="flex flex-col items-end">
               <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest leading-none mb-1">Your City</span>
-              <span className="text-sm font-bold text-slate-900 dark:text-white">Lahore</span>
+              <span className="text-sm font-bold text-slate-900 dark:text-white">{cityName}</span>
            </div>
-           <div className="w-px h-8 bg-orange-200 dark:bg-slate-700"></div>
-           <div className="flex flex-col items-end">
-              <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest leading-none mb-1">Balance</span>
-              <span className="text-sm font-bold text-orange-600 dark:text-orange-400">Rs. {user.walletBalance.toLocaleString()}</span>
-           </div>
+           {activeRole === UserRole.HELPER && (
+             <>
+               <div className="w-px h-8 bg-orange-200 dark:bg-slate-700"></div>
+               <div className="flex flex-col items-end">
+                  <span className="text-[9px] font-bold text-slate-400 uppercase tracking-widest leading-none mb-1">Balance</span>
+                  <span className="text-sm font-bold text-orange-600 dark:text-orange-400">Rs. {user.walletBalance.toLocaleString()}</span>
+               </div>
+             </>
+           )}
         </div>
-
-        <button 
-          onClick={onSwitchRole}
-          className={`group relative flex items-center gap-3 px-5 py-2.5 rounded-2xl font-bold text-[10px] tracking-widest transition-all shadow-lg active:scale-95 ${activeRole === UserRole.LOSTER ? 'bg-orange-500 text-white shadow-orange-500/20' : 'bg-slate-900 text-white shadow-slate-900/20'}`}
-        >
-          {activeRole === UserRole.LOSTER ? 'SWITCH TO HELPER' : 'SWITCH TO POSTER'}
-          <RefreshCw className="w-3 h-3 group-hover:rotate-180 transition-transform duration-500 ml-1" />
-        </button>
 
         <button 
           onClick={onToggleNotifs}
@@ -862,7 +1392,7 @@ function BottomNav({ currentPage, setCurrentPage, activeRole }: { currentPage: s
     <nav className="fixed bottom-6 left-6 right-6 lg:left-6 lg:top-1/2 lg:-translate-y-1/2 lg:bottom-auto lg:right-auto lg:h-auto lg:max-h-[80vh] lg:w-16 bg-white dark:bg-slate-900 border border-orange-100 dark:border-slate-800 rounded-[2rem] flex items-center justify-around p-2 lg:flex-col lg:py-8 lg:gap-6 z-50 shadow-[0_15px_35px_rgba(255,138,113,0.12)] dark:shadow-none transition-colors">
       <NavButton active={currentPage === 'DASHBOARD'} onClick={() => setCurrentPage('DASHBOARD')} icon={Compass} label="Dashboard" />
       
-      {!isHelper && <NavButton active={currentPage === 'MAP'} onClick={() => setCurrentPage('MAP')} icon={MapIcon} label="Map View" />}
+      {isHelper && <NavButton active={currentPage === 'MAP'} onClick={() => setCurrentPage('MAP')} icon={MapIcon} label="Map View" />}
       
       {activeRole === UserRole.LOSTER ? (
         <motion.button 
@@ -905,64 +1435,95 @@ function NavButton({ active, icon: Icon, label, onClick }: { active: boolean, ic
   );
 }
 
-function FullMapView({ quests, onQuestClick, searchQuery, onSearch, onSelectSuggestion, suggestions, onDetectLocation, mapCenter, userLocation, isLoaded }: any) {
+function FullMapView({ quests, onQuestClick, onJoinQuest, searchQuery, onSearch, onSelectSuggestion, suggestions, onDetectLocation, mapCenter, userLocation, isLoaded, hoveredQuestId: externalHoveredId }: any) {
   const [filterCat, setFilterCat] = useState('All Categories');
   const [filterPrice, setFilterPrice] = useState('Any Reward');
   const [selectedQuest, setSelectedQuest] = useState<Quest | null>(null);
   const [map, setMap] = useState<google.maps.Map | null>(null);
 
+  const [internalHoveredId, setInternalHoveredId] = useState<string | null>(null);
+  const hoveredQuestId = externalHoveredId || internalHoveredId;
+
   const onLoad = React.useCallback(function callback(m: google.maps.Map) {
     setMap(m);
   }, []);
 
-  const onUnmount = React.useCallback(function callback(m: google.maps.Map) {
+  const onUnmount = React.useCallback(function callback() {
     setMap(null);
   }, []);
 
-  const filteredQuests = quests.filter((q: Quest) => {
-    const catMatch = filterCat === 'All Categories' || q.category === filterCat;
-    const reward = Number(q.rewardAmount);
-    const priceMatch = filterPrice === 'Any Reward' || (
-      filterPrice === '< 500' ? reward < 500 :
-      filterPrice === '500 - 2000' ? (reward >= 500 && reward <= 2000) :
-      filterPrice === '> 2000' ? reward > 2000 : true
-    );
-    return catMatch && priceMatch;
-  });
+  // Sync map center if it changes externally
+  useEffect(() => {
+    if (map && mapCenter) {
+      map.setCenter(mapCenter);
+    }
+  }, [map, mapCenter]);
 
-  // Fit bounds when quests change
+  // Handle map center update when userLocation is first detected
+  useEffect(() => {
+     if (map && userLocation && !mapCenter) {
+        map.panTo(userLocation);
+     }
+  }, [map, userLocation]);
+
+  const filteredQuests = useMemo(() => {
+    return quests.filter((q: Quest) => {
+      const catMatch = filterCat === 'All Categories' || q.category === filterCat;
+      const reward = Number(q.rewardAmount);
+      const priceMatch = filterPrice === 'Any Reward' || (
+        filterPrice === '< 500' ? reward < 500 :
+        filterPrice === '500 - 2000' ? (reward >= 500 && reward <= 2000) :
+        filterPrice === '> 2000' ? reward > 2000 : true
+      );
+      return catMatch && priceMatch;
+    });
+  }, [quests, filterCat, filterPrice]);
+
+  // Count occurrences of locations to apply jitter to overlapping markers
+  const locationCounts = useMemo(() => {
+    const counts: Record<string, number> = {};
+    filteredQuests.forEach((q: Quest) => {
+      if (q.locations && q.locations[0]) {
+        const key = `${q.locations[0].lat.toFixed(6)},${q.locations[0].lng.toFixed(6)}`;
+        counts[key] = (counts[key] || 0) + 1;
+      }
+    });
+    return counts;
+  }, [filteredQuests]);
+
+  const markersProcessedSoFar: Record<string, number> = {};
+
+  // Fit bounds when map or quests change
   useEffect(() => {
     if (map && isLoaded && typeof google !== 'undefined' && filteredQuests.length > 0) {
       const bounds = new google.maps.LatLngBounds();
+      let hasValidCoords = false;
       filteredQuests.forEach((q: Quest) => {
         if (q.locations && q.locations.length > 0) {
           bounds.extend(new google.maps.LatLng(q.locations[0].lat, q.locations[0].lng));
+          hasValidCoords = true;
         }
       });
       if (userLocation) {
         bounds.extend(new google.maps.LatLng(userLocation.lat, userLocation.lng));
+        hasValidCoords = true;
       }
       
-      // Only fit bounds if there are multiple markers or markers are far from center
-      if (!bounds.isEmpty()) {
+      // Only fit bounds if we actually have markers to show
+      if (hasValidCoords && !bounds.isEmpty()) {
         map.fitBounds(bounds);
         // Don't zoom in too much
-        if ((map.getZoom() || 0) > 16) {
-          map.setZoom(14);
-        }
+        google.maps.event.addListenerOnce(map, 'idle', () => {
+          if ((map.getZoom() || 0) > 16) {
+            map.setZoom(14);
+          }
+        });
       }
     }
-  }, [map, filteredQuests, isLoaded, userLocation]);
-
-  // Pan to center when mapCenter changes manually
-  useEffect(() => {
-    if (map && mapCenter) {
-      map.panTo(mapCenter);
-    }
-  }, [map, mapCenter]);
+  }, [map, filteredQuests.length, isLoaded, !!userLocation]); // Stable dependencies
 
   return (
-    <div className="h-full flex flex-col relative group overflow-hidden lg:rounded-[2.5rem] lg:shadow-2xl bg-white border border-slate-100">
+    <div className="h-full w-full flex flex-col relative group overflow-hidden bg-white dark:bg-slate-900 border border-slate-100 dark:border-slate-800 lg:rounded-[2.5rem] lg:shadow-2xl transition-all">
       {/* Search & Filter Interface */}
       <div className="absolute top-4 left-4 right-4 z-10 flex flex-col gap-2 max-w-xl">
         <div className="bg-white/95 backdrop-blur-sm border border-orange-100 rounded-2xl p-1.5 shadow-xl focus-within:ring-2 focus-within:ring-orange-200 transition-all flex items-center gap-2">
@@ -1014,6 +1575,19 @@ function FullMapView({ quests, onQuestClick, searchQuery, onSearch, onSelectSugg
           </select>
         </div>
         
+        {/* Legend */}
+        <div className="absolute bottom-4 left-4 z-10 bg-white/95 backdrop-blur-sm border border-orange-100 rounded-xl p-3 shadow-xl flex flex-col gap-2">
+           <p className="text-[8px] font-black uppercase tracking-widest text-slate-400 mb-1">Status Legend</p>
+           <div className="flex items-center gap-2">
+              <div className="w-2.5 h-2.5 rounded-full bg-green-500 shadow-[0_0_8px_rgba(34,197,94,0.4)]"></div>
+              <span className="text-[9px] font-bold text-slate-600">Active Quest</span>
+           </div>
+           <div className="flex items-center gap-2">
+              <div className="w-2.5 h-2.5 rounded-full bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.4)]"></div>
+              <span className="text-[9px] font-bold text-slate-600">Closed / Found</span>
+           </div>
+        </div>
+
         {suggestions.length > 0 && searchQuery && (
           <div className="bg-white rounded-xl p-2 shadow-2xl border border-orange-50 space-y-0.5 max-h-60 overflow-y-auto">
             {suggestions.map((s: string, i: number) => (
@@ -1060,19 +1634,43 @@ function FullMapView({ quests, onQuestClick, searchQuery, onSearch, onSelectSugg
             )}
 
             {isLoaded && typeof google !== 'undefined' && filteredQuests.map((q: Quest, i: number) => {
-              const location = q.locations && q.locations.length > 0 
+              const baseLocation = q.locations && q.locations.length > 0 
                 ? q.locations[0] 
-                : { lat: mapCenter.lat + (Math.sin(i) * 0.01), lng: mapCenter.lng + (Math.cos(i) * 0.01) };
+                : { lat: mapCenter.lat, lng: mapCenter.lng };
               
+              const coordKey = `${baseLocation.lat.toFixed(6)},${baseLocation.lng.toFixed(6)}`;
+              const overlapIndex = markersProcessedSoFar[coordKey] || 0;
+              markersProcessedSoFar[coordKey] = overlapIndex + 1;
+
+              // Apply deterministic jitter for overlapping markers
+              // A very small offset (approx 5-10 meters) if overlapping
+              const jitterAmount = 0.00008; 
+              const angle = (overlapIndex / (locationCounts[coordKey] || 1)) * Math.PI * 2;
+              const jitterLat = overlapIndex > 0 ? Math.cos(angle) * jitterAmount : 0;
+              const jitterLng = overlapIndex > 0 ? Math.sin(angle) * jitterAmount : 0;
+
+              const displayPos = {
+                lat: baseLocation.lat + jitterLat,
+                lng: baseLocation.lng + jitterLng
+              };
+
+              const isHovered = hoveredQuestId === q.id;
+
               return (
                 <MarkerF
                   key={q.id}
-                  position={{ lat: location.lat, lng: location.lng }}
+                  position={displayPos}
                   onClick={() => setSelectedQuest(q)}
-                  animation={google.maps.Animation.DROP}
+                  onMouseOver={() => {
+                    setSelectedQuest(q);
+                    setInternalHoveredId(q.id);
+                  }}
+                  onMouseOut={() => setInternalHoveredId(null)}
+                  animation={isHovered ? google.maps.Animation.BOUNCE : google.maps.Animation.DROP}
                   icon={{
-                    url: 'https://maps.google.com/mapfiles/ms/icons/red-dot.png',
-                    scaledSize: new google.maps.Size(40, 40)
+                    url: q.status === 'ACTIVE' ? 'https://maps.google.com/mapfiles/ms/icons/green-dot.png' : 'https://maps.google.com/mapfiles/ms/icons/red-dot.png',
+                    scaledSize: isHovered ? new google.maps.Size(50, 50) : new google.maps.Size(40, 40),
+                    anchor: isHovered ? new google.maps.Point(25, 50) : new google.maps.Point(20, 40)
                   } as any}
                 />
               );
@@ -1106,11 +1704,13 @@ function FullMapView({ quests, onQuestClick, searchQuery, onSearch, onSelectSugg
                       </button>
                       <button 
                         onClick={() => {
-                          onQuestClick(selectedQuest.id);
+                          if (onJoinQuest) {
+                            onJoinQuest(selectedQuest.id);
+                          }
                         }}
                          className="flex-1 py-2.5 bg-orange-500 text-white rounded-xl text-[9px] font-black italic uppercase tracking-[0.15em] shadow-lg shadow-orange-200 active:scale-95 transition-all"
                       >
-                        Intercept
+                        Join Quest
                       </button>
                     </div>
                   </div>
@@ -1127,8 +1727,30 @@ function FullMapView({ quests, onQuestClick, searchQuery, onSearch, onSelectSugg
           </div>
         )}
 
-        <div className="absolute bottom-4 right-4 z-10">
-           <div className="bg-white/90 backdrop-blur-md border border-orange-100 p-3 rounded-2xl shadow-xl text-slate-900">
+        <div className="absolute bottom-4 right-4 z-10 flex flex-col gap-2 items-end">
+           {/* Marker Legend */}
+           <div className="bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border border-orange-100 dark:border-slate-800 p-3 rounded-2xl shadow-xl text-slate-900 dark:text-white transition-colors">
+              <div className="flex items-center gap-2 mb-3 px-1">
+                 <div className="w-1 h-3 bg-orange-500 rounded-full"></div>
+                 <h4 className="text-[9px] font-black uppercase tracking-widest text-slate-400 dark:text-slate-500">Network Map Guide</h4>
+              </div>
+              <div className="space-y-2">
+                 <div className="flex items-center gap-3">
+                    <img src="https://maps.google.com/mapfiles/ms/icons/green-dot.png" className="w-4 h-4 object-contain" />
+                    <span className="text-[10px] font-bold text-slate-600 dark:text-slate-300">ACTIVE LOST ITEM</span>
+                 </div>
+                 <div className="flex items-center gap-3">
+                    <img src="https://maps.google.com/mapfiles/ms/icons/blue-dot.png" className="w-4 h-4 object-contain" />
+                    <span className="text-[10px] font-bold text-slate-600 dark:text-slate-300">YOUR LOCATION</span>
+                 </div>
+                 <div className="flex items-center gap-3 opacity-50">
+                    <img src="https://maps.google.com/mapfiles/ms/icons/red-dot.png" className="w-4 h-4 object-contain" />
+                    <span className="text-[10px] font-bold text-slate-600 dark:text-slate-300">RECOVERED / CLOSED</span>
+                 </div>
+              </div>
+           </div>
+
+           <div className="bg-white/90 dark:bg-slate-900/90 backdrop-blur-md border border-orange-100 dark:border-slate-800 p-3 rounded-2xl shadow-xl text-slate-900 dark:text-white">
               <div className="flex items-center gap-2 mb-2">
                  <div className="w-1 h-4 bg-orange-500 rounded-full animate-pulse"></div>
                  <h4 className="text-[8px] font-bold uppercase tracking-widest text-slate-400">Live Status</h4>
@@ -1136,9 +1758,9 @@ function FullMapView({ quests, onQuestClick, searchQuery, onSearch, onSelectSugg
               <div className="flex gap-4">
                  <div>
                     <span className="text-[7px] text-slate-400 font-bold uppercase block">Items</span>
-                    <p className="text-xs font-bold text-slate-900">{filteredQuests.length}</p>
+                    <p className="text-xs font-bold text-slate-900 dark:text-white">{filteredQuests.length}</p>
                  </div>
-                 <div className="w-px h-5 bg-orange-100" />
+                 <div className="w-px h-5 bg-orange-100 dark:bg-slate-700" />
                  <div>
                     <span className="text-[7px] text-slate-400 font-bold uppercase block">Active</span>
                     <p className="text-xs font-bold text-orange-500">2.4K</p>
@@ -1151,56 +1773,69 @@ function FullMapView({ quests, onQuestClick, searchQuery, onSearch, onSelectSugg
   );
 }
 
-function AdminPanel({ claims, onApprove }: any) {
-  return (
-    <div className="p-4 space-y-6">
-      <div>
-        <h2 className="text-3xl font-bold text-slate-900 dark:text-white tracking-tight">Review Help</h2>
-        <p className="text-slate-500 dark:text-slate-400 text-sm font-medium">Help our community by checking these found items.</p>
-      </div>
 
-      <div className="space-y-4">
-        {claims.map((c: any) => (
-          <div key={c.id} className="bg-white dark:bg-slate-800 rounded-3xl p-6 border border-orange-100 dark:border-slate-700 shadow-sm transition-colors">
-            <div className="flex justify-between items-start mb-4">
-              <span className={`text-[10px] font-bold px-3 py-1 rounded-full ${c.status === 'PENDING' ? 'bg-orange-100 dark:bg-orange-900/40 text-orange-600 dark:text-orange-400' : 'bg-green-100 dark:bg-green-900/40 text-green-600 dark:text-green-400'}`}>
-                {c.status === 'PENDING' ? 'Waiting' : 'Checked'}
-              </span>
-            </div>
-            <div className="flex gap-4">
-               <div className="w-20 h-20 bg-orange-50 dark:bg-slate-700 rounded-2xl flex items-center justify-center border border-orange-50 dark:border-slate-600">
-                  <Camera className="w-8 h-8 text-orange-200 dark:text-slate-600" />
-               </div>
-               <div className="flex-1">
-                  <h4 className="text-sm font-bold text-slate-900 dark:text-white">Proof for Finding</h4>
-                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">Found in: {c.foundLocation.address}</p>
-                  <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 font-medium italic">Status: {c.condition}</p>
-               </div>
-            </div>
-            {c.status === 'PENDING' && (
-              <div className="flex gap-3 mt-6">
-                <button className="flex-1 py-3 bg-slate-50 dark:bg-slate-700 hover:bg-slate-100 dark:hover:bg-slate-600 rounded-xl text-xs font-bold text-slate-500 dark:text-slate-400 transition-colors">SKIP</button>
-                <button onClick={() => onApprove(c.id)} className="flex-[2] py-3 bg-orange-500 hover:bg-orange-600 text-white rounded-xl text-xs font-bold shadow-md shadow-orange-100 transition-colors">CONFIRM FINDING</button>
-              </div>
-            )}
-          </div>
-        ))}
-        {claims.length === 0 && (
-           <div className="text-center py-24">
-             <div className="w-16 h-16 bg-orange-50 rounded-full flex items-center justify-center mx-auto mb-4">
-               <CheckCircle2 className="w-8 h-8 text-orange-200" />
-             </div>
-             <p className="text-slate-400 font-medium">No items waiting for review!</p>
-           </div>
-        )}
-      </div>
-    </div>
+
+function LosterDashboard({ user, quests, allClaims, onAddClick, onQuestClick, onChatClick, onApproveClaim, onRejectClaim }: any) {
+  const pendingClaims = allClaims.filter((c: any) => 
+    c.status === 'PENDING' && quests.some((q: any) => q.id === c.questId)
   );
-}
 
-function LosterDashboard({ user, quests, onAddClick, onQuestClick, onChatClick }: any) {
   return (
     <div className="p-4 sm:p-0 space-y-8 lg:space-y-12 pb-48">
+      {pendingClaims.length > 0 && (
+        <section className="bg-orange-50 dark:bg-orange-900/10 border-2 border-orange-200 dark:border-orange-900/30 rounded-[3rem] p-8 lg:p-10 shadow-xl shadow-orange-100 dark:shadow-none">
+          <div className="flex items-center gap-4 mb-8">
+            <div className="w-12 h-12 bg-orange-500 rounded-2xl flex items-center justify-center shadow-lg shadow-orange-200">
+              <ShieldCheck className="w-6 h-6 text-white" />
+            </div>
+            <div>
+              <h2 className="text-2xl font-black italic text-slate-900 dark:text-white uppercase tracking-tight">Claims Unlocked</h2>
+              <p className="text-[10px] font-bold text-orange-600 dark:text-orange-400 uppercase tracking-widest mt-1">{pendingClaims.length} neighbors claim to have found your items</p>
+            </div>
+          </div>
+
+          <div className="grid gap-6">
+            {pendingClaims.map((claim: any) => {
+              const quest = quests.find((q: any) => q.id === claim.questId);
+              return (
+                <div key={claim.id} className="bg-white dark:bg-slate-800 rounded-3xl p-6 border border-orange-100 dark:border-slate-700 shadow-sm flex flex-col md:flex-row gap-8">
+                  <div className="flex gap-2 shrink-0">
+                    {claim.evidenceImages.map((img: string, i: number) => (
+                      <img key={i} src={img} className="w-24 h-24 rounded-2xl object-cover border-2 border-orange-50 shadow-sm" />
+                    ))}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex justify-between items-start mb-2">
+                       <h4 className="text-sm font-black italic uppercase text-slate-900 dark:text-white truncate">Item Identified: {quest?.title}</h4>
+                       <span className="text-[10px] font-bold bg-green-100 text-green-700 px-2 py-1 rounded-full uppercase">Verified Range</span>
+                    </div>
+                    <p className="text-xs font-medium text-slate-500 mb-4 line-clamp-2 italic">"{claim.condition}"</p>
+                    <div className="flex items-center gap-2 text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                       <MapPin className="w-3 h-3" />
+                       {claim.foundLocation?.address}
+                    </div>
+                  </div>
+                  <div className="shrink-0 flex md:flex-col gap-2">
+                    <button 
+                      onClick={() => onApproveClaim(claim.id)}
+                      className="flex-1 px-6 py-3 bg-green-500 hover:bg-green-600 text-white rounded-xl text-[10px] font-black italic uppercase tracking-widest shadow-lg shadow-green-100 active:scale-95 transition-all"
+                    >
+                      APPROVE & PAY
+                    </button>
+                    <button 
+                      onClick={() => onRejectClaim(claim.id)}
+                      className="flex-1 px-6 py-3 bg-white hover:bg-slate-50 text-slate-400 border border-slate-200 rounded-xl text-[10px] font-black italic uppercase tracking-widest active:scale-95 transition-all"
+                    >
+                      DECLINE
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
       <section>
         <div className="flex justify-between items-end mb-6 lg:mb-8">
           <div>
@@ -1252,7 +1887,7 @@ function LosterDashboard({ user, quests, onAddClick, onQuestClick, onChatClick }
           {[
             { icon: Camera, title: "Clear Photos", desc: "Take good photos so helpers know exactly what to look for." },
             { icon: Navigation, title: "Correct Location", desc: "Mark the exact area where you think you lost it." },
-            { icon: DollarSign, title: "Offer a Gift", desc: "Small rewards can help motivate our community to look faster." }
+            { icon: Gift, title: "Acknowledge Help", desc: "A thoughtful reward can motivate our community to look faster." }
           ].map((item, i) => (
             <div key={i} className="space-y-4">
               <div className="w-14 h-14 rounded-[1.25rem] bg-orange-50 dark:bg-slate-700 flex items-center justify-center group-hover:scale-110 transition-transform">
@@ -1360,11 +1995,14 @@ function QuestCard({ quest, onClick, onChatClick }: QuestCardProps) {
 }
 
 function HelperDashboard({ quests, joinedQuests, onQuestClick, onJoinQuest, onChatClick, searchQuery, onSearch, onSelectSuggestion, suggestions, onDetectLocation, mapCenter, userLocation, isLoaded }: any) {
+  const [hoveredQuestId, setHoveredQuestId] = useState<string | null>(null);
+
   return (
-    <div className="h-[calc(100vh-180px)] lg:h-[calc(100vh-100px)] relative pb-48 lg:pb-32">
+    <div className="h-[calc(100vh-140px)] lg:h-[calc(100vh-100px)] relative px-4 lg:px-0 flex flex-col">
       <FullMapView 
         quests={quests} 
         onQuestClick={onQuestClick} 
+        onJoinQuest={onJoinQuest}
         searchQuery={searchQuery} 
         onSearch={onSearch} 
         onSelectSuggestion={onSelectSuggestion}
@@ -1373,33 +2011,31 @@ function HelperDashboard({ quests, joinedQuests, onQuestClick, onJoinQuest, onCh
         mapCenter={mapCenter} 
         userLocation={userLocation}
         isLoaded={isLoaded}
+        hoveredQuestId={hoveredQuestId}
       />
-      
+
       {/* Joined Quests Floating Panel */}
       {joinedQuests.length > 0 && (
-        <div className="absolute bottom-6 left-6 right-6 lg:left-auto lg:right-6 lg:w-96 z-30">
-          <div className="bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border border-orange-100 dark:border-slate-800 rounded-[2rem] p-5 shadow-2xl transition-colors">
+        <div className="absolute top-24 right-6 w-80 z-30 hidden lg:block">
+          <div className="bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border border-orange-100 dark:border-slate-800 rounded-[2rem] p-5 shadow-2xl transition-colors max-h-[50vh] overflow-y-auto custom-scrollbar">
             <div className="flex items-center justify-between mb-4 px-2">
                <h3 className="text-xs font-bold uppercase tracking-widest text-slate-500 dark:text-slate-400 flex items-center gap-2">
                  <ShieldCheck className="w-4 h-4 text-orange-500" />
-                 Your Current Jobs
+                 Active Jobs
                </h3>
-               <span className="text-[10px] font-bold text-orange-500">{joinedQuests.length} ACTIVE</span>
+               <span className="text-[10px] font-bold text-orange-500">{joinedQuests.length}</span>
             </div>
             <div className="space-y-3">
               {joinedQuests.map((q: Quest) => (
                 <div key={q.id} className="bg-orange-50/50 dark:bg-slate-800 border border-orange-100 dark:border-slate-700 rounded-2xl p-3 flex items-center gap-4 group hover:bg-orange-100/50 dark:hover:bg-slate-700 transition-all">
-                   <img src={q.images[0]} className="w-12 h-12 rounded-xl object-cover shadow-sm" />
+                   <img src={q.images[0]} className="w-10 h-10 rounded-xl object-cover shadow-sm" />
                    <div className="flex-1 min-w-0">
-                      <h4 className="text-xs font-bold text-slate-900 dark:text-white truncate">{q.title}</h4>
-                      <p className="text-[10px] text-slate-500 dark:text-slate-400 truncate">{q.locations[0]?.name}</p>
+                      <h4 className="text-[10px] font-bold text-slate-900 dark:text-white truncate uppercase">{q.title}</h4>
+                      <p className="text-[9px] text-slate-500 dark:text-slate-400 truncate font-medium">{q.locations[0]?.name.split(',')[0]}</p>
                    </div>
                    <div className="flex gap-2">
-                     <button onClick={() => onChatClick(q.id)} className="w-8 h-8 bg-orange-500 rounded-lg flex items-center justify-center text-white shadow-sm hover:scale-110 transition-transform">
-                        <MessageSquare className="w-4 h-4" />
-                     </button>
-                     <button onClick={() => onQuestClick(q.id)} className="w-8 h-8 bg-white dark:bg-slate-700 border border-orange-200 dark:border-slate-600 text-orange-500 rounded-lg flex items-center justify-center shadow-sm hover:scale-110 transition-transform">
-                        <Navigation className="w-4 h-4" />
+                     <button onClick={() => onChatClick(q.id)} className="w-7 h-7 bg-orange-500 rounded-lg flex items-center justify-center text-white shadow-sm hover:scale-110 transition-transform">
+                        <MessageSquare className="w-3.5 h-3.5" />
                      </button>
                    </div>
                 </div>
@@ -1408,20 +2044,33 @@ function HelperDashboard({ quests, joinedQuests, onQuestClick, onJoinQuest, onCh
           </div>
         </div>
       )}
+
+      {/* Mobile Jobs Badge */}
+      {joinedQuests.length > 0 && (
+        <div className="lg:hidden absolute top-20 right-4 z-40">
+           <button 
+             className="w-10 h-10 bg-orange-500 text-white rounded-xl shadow-xl flex items-center justify-center relative active:scale-95 transition-all"
+           >
+              <ShieldCheck className="w-5 h-5" />
+              <div className="absolute -top-1 -right-1 w-4 h-4 bg-slate-900 text-[8px] font-bold flex items-center justify-center rounded-full border border-white">{joinedQuests.length}</div>
+           </button>
+        </div>
+      )}
     </div>
   );
 }
 
-function AddQuestFlow({ onCancel, onPublish, isLoaded }: { onCancel: () => void, onPublish: (form: Partial<Quest>) => void, isLoaded: boolean }) {
+function AddQuestFlow({ onCancel, onPublish, isLoaded, isPublishing }: { onCancel: () => void, onPublish: (form: Partial<Quest>) => void, isLoaded: boolean, isPublishing: boolean }) {
   const [step, setStep] = useState(1);
   const [form, setForm] = useState<Partial<Quest>>({
     title: '',
     category: CATEGORIES[0],
     description: '',
     images: [],
-    rewardAmount: 500,
+    rewardAmount: 5000,
     locations: []
   });
+  const [errors, setErrors] = useState<{ [key: string]: string }>({});
   const [moderating, setModerating] = useState(false);
   const [moderationResult, setModerationResult] = useState<any>(null);
 
@@ -1433,18 +2082,33 @@ function AddQuestFlow({ onCancel, onPublish, isLoaded }: { onCancel: () => void,
   const steps = ["Details", "Photos", "Recovery Guide", "Reward", "Post"];
 
   const handleNext = () => {
-    if (step === 1 && (!form.title || !form.description)) {
-      alert("Please enter the name and description of the item.");
+    let newErrors: any = {};
+    if (step === 1) {
+      if (!form.title) newErrors.title = "Name is required.";
+      if (!form.description) newErrors.description = "Description is required.";
+    }
+    if (step === 2) {
+      if ((form.images?.length || 0) < 1) {
+        newErrors.images = "Please upload at least 1 photo.";
+      }
+    }
+    if (step === 3) {
+      if ((form.locations?.length || 0) < 1) {
+        newErrors.locations = "Please add at least 1 location.";
+      }
+    }
+    if (step === 4) {
+      const reward = form.rewardAmount || 0;
+      if (reward < 5000 || reward > 50000) {
+        newErrors.rewardAmount = "Reward must be between Rs. 5000 and Rs. 50000.";
+      }
+    }
+
+    if (Object.keys(newErrors).length > 0) {
+      setErrors(newErrors);
       return;
     }
-    if (step === 2 && (form.images?.length || 0) < 1) {
-      alert("Please upload at least 1 photo of the item.");
-      return;
-    }
-    if (step === 3 && (form.locations?.length || 0) < 1) {
-      alert("Please add at least 1 possible location where you lost the item.");
-      return;
-    }
+    setErrors({});
     setStep(step + 1);
   };
 
@@ -1532,15 +2196,16 @@ function AddQuestFlow({ onCancel, onPublish, isLoaded }: { onCancel: () => void,
               <h2 className="text-3xl font-black italic text-slate-900 dark:text-white tracking-tight">Main Details</h2>
               <p className="text-slate-400 dark:text-slate-500 font-medium text-sm">Tell the community what to look for.</p>
             </div>
-            <div className="space-y-6">
+              <div className="space-y-6">
               <div className="space-y-2">
                 <label className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] ml-1">Item Title</label>
                 <input 
                   value={form.title}
                   onChange={(e) => setForm({...form, title: e.target.value})}
                   placeholder="e.g. Blue Nike Backpack" 
-                  className="w-full bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-2xl px-6 py-4 text-sm font-bold placeholder:text-slate-300 dark:placeholder:text-slate-600 dark:text-white focus:border-orange-500 focus:ring-4 focus:ring-orange-500/10 outline-none transition-all shadow-sm" 
+                  className={`w-full bg-white dark:bg-slate-800 border ${errors.title ? 'border-red-500 focus:border-red-500 focus:ring-red-500/10' : 'border-slate-200 dark:border-slate-700 focus:border-orange-500 focus:ring-orange-500/10'} rounded-2xl px-6 py-4 text-sm font-bold placeholder:text-slate-300 dark:placeholder:text-slate-600 dark:text-white focus:ring-4 outline-none transition-all shadow-sm`} 
                 />
+                {errors.title && <p className="text-red-500 text-xs font-bold ml-1">{errors.title}</p>}
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div className="space-y-2">
@@ -1575,8 +2240,9 @@ function AddQuestFlow({ onCancel, onPublish, isLoaded }: { onCancel: () => void,
                   onChange={(e) => setForm({...form, description: e.target.value})}
                   rows={4}
                   placeholder="Mention unique features, contents, or serial numbers..." 
-                  className="w-full bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-2xl px-6 py-4 text-sm font-bold dark:text-white placeholder:text-slate-300 dark:placeholder:text-slate-600 focus:border-orange-500 outline-none shadow-sm resize-none"
+                  className={`w-full bg-white dark:bg-slate-800 border ${errors.description ? 'border-red-500 focus:border-red-500' : 'border-slate-200 dark:border-slate-700 focus:border-orange-500'} rounded-2xl px-6 py-4 text-sm font-bold dark:text-white placeholder:text-slate-300 dark:placeholder:text-slate-600 outline-none shadow-sm resize-none`}
                 />
+                {errors.description && <p className="text-red-500 text-xs font-bold ml-1">{errors.description}</p>}
               </div>
             </div>
           </motion.div>
@@ -1602,17 +2268,20 @@ function AddQuestFlow({ onCancel, onPublish, isLoaded }: { onCancel: () => void,
                 </div>
               ))}
               {(form.images?.length || 0) < 1 && (
-                <label className="aspect-square rounded-3xl bg-white dark:bg-slate-800 border-2 border-dashed border-slate-200 dark:border-slate-700 flex flex-col items-center justify-center cursor-pointer hover:border-orange-300 hover:bg-orange-50/20 dark:hover:bg-slate-700 transition-all group">
-                  {moderating ? (
-                    <Clock className="w-8 h-8 text-orange-500 animate-spin" />
-                  ) : (
-                    <Camera className="w-8 h-8 text-slate-300 dark:text-slate-600 group-hover:text-orange-400 group-hover:scale-110 transition-all" />
-                  )}
-                  <span className="text-[10px] font-black text-slate-400 dark:text-slate-500 mt-4 uppercase tracking-[0.2em]">
-                    {moderating ? 'Scanning...' : 'Add Photo'}
-                  </span>
-                  <input type="file" className="hidden" accept="image/*" onChange={(e: any) => handleImageUpload(e)} />
-                </label>
+                <div className="space-y-2">
+                  <label className={`aspect-square rounded-3xl bg-white dark:bg-slate-800 border-2 border-dashed ${errors.images ? 'border-red-500 hover:border-red-600' : 'border-slate-200 dark:border-slate-700 hover:border-orange-300'} flex flex-col items-center justify-center cursor-pointer hover:bg-orange-50/20 dark:hover:bg-slate-700 transition-all group`}>
+                    {moderating ? (
+                      <Clock className="w-8 h-8 text-orange-500 animate-spin" />
+                    ) : (
+                      <Camera className={`w-8 h-8 ${errors.images ? 'text-red-400 group-hover:text-red-500' : 'text-slate-300 dark:text-slate-600 group-hover:text-orange-400'} group-hover:scale-110 transition-all`} />
+                    )}
+                    <span className={`text-[10px] font-black ${errors.images ? 'text-red-500' : 'text-slate-400 dark:text-slate-500'} mt-4 uppercase tracking-[0.2em]`}>
+                      {moderating ? 'Scanning...' : 'Add Photo'}
+                    </span>
+                    <input type="file" className="hidden" accept="image/*" onChange={(e: any) => handleImageUpload(e)} disabled={moderating} />
+                  </label>
+                  {errors.images && <p className="text-red-500 text-center text-xs font-bold w-full">{errors.images}</p>}
+                </div>
               )}
             </div>
 
@@ -1633,10 +2302,10 @@ function AddQuestFlow({ onCancel, onPublish, isLoaded }: { onCancel: () => void,
             </div>
 
             <div className="space-y-8">
-              <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-[2.5rem] p-8 shadow-xl transition-colors">
+              <div className={`bg-white dark:bg-slate-800 border ${errors.locations ? 'border-red-500' : 'border-slate-200 dark:border-slate-700'} rounded-[2.5rem] p-8 shadow-xl transition-colors`}>
                  <div className="flex justify-between items-center mb-6">
                     <h3 className="text-xl font-black italic text-slate-900 dark:text-white">Saved Locations</h3>
-                    <p className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase">Up to 5 spots</p>
+                    <p className={`text-[10px] font-black ${errors.locations ? 'text-red-500' : 'text-slate-400 dark:text-slate-500'} uppercase`}>Up to 5 spots</p>
                  </div>
                  
                  <div className="space-y-3">
@@ -1658,7 +2327,10 @@ function AddQuestFlow({ onCancel, onPublish, isLoaded }: { onCancel: () => void,
                       </div>
                     ))}
                     {(!form.locations || form.locations.length === 0) && (
-                      <p className="text-center py-6 text-slate-300 font-bold italic text-sm">No locations added yet.</p>
+                      <div className="text-center space-y-2">
+                        <p className={`py-6 font-bold italic text-sm ${errors.locations ? 'text-red-500' : 'text-slate-300'}`}>No locations added yet.</p>
+                        {errors.locations && <p className="text-red-500 text-xs font-bold">{errors.locations}</p>}
+                      </div>
                     )}
                  </div>
               </div>
@@ -1736,31 +2408,34 @@ function AddQuestFlow({ onCancel, onPublish, isLoaded }: { onCancel: () => void,
               <p className="text-slate-400 font-medium text-sm">Motivation for your neighbors to keep their eyes open.</p>
             </div>
             
-            <div className="bg-white dark:bg-slate-800 border-2 border-orange-500 p-12 rounded-[3.5rem] flex flex-col items-center shadow-2xl relative overflow-hidden transition-colors">
-              <span className="text-[10px] font-black text-orange-500 uppercase tracking-[0.5em] mb-6 relative z-10">Your Bounty</span>
+            <div className={`bg-white dark:bg-slate-800 border-2 ${errors.rewardAmount ? 'border-red-500' : 'border-orange-500'} p-12 rounded-[3.5rem] flex flex-col items-center shadow-2xl relative overflow-hidden transition-colors`}>
+              <span className={`text-[10px] font-black ${errors.rewardAmount ? 'text-red-500' : 'text-orange-500'} uppercase tracking-[0.5em] mb-6 relative z-10`}>Your Bounty</span>
               <div className="flex items-center gap-4 mb-4 relative z-10">
-                <span className="text-4xl font-black italic text-slate-300 dark:text-slate-600">Rs.</span>
+                <span className={`text-4xl font-black italic ${errors.rewardAmount ? 'text-red-400' : 'text-slate-300 dark:text-slate-600'}`}>Rs.</span>
                 <input 
                    type="number"
                    value={form.rewardAmount}
                    onChange={(e) => setForm({...form, rewardAmount: Number(e.target.value)})}
-                   className="text-7xl font-black italic text-slate-900 dark:text-white w-48 bg-transparent outline-none text-center tracking-tighter" 
+                   className={`text-7xl font-black italic ${errors.rewardAmount ? 'text-red-500' : 'text-slate-900 dark:text-white'} w-64 bg-transparent outline-none text-center tracking-tighter`} 
+                   min="5000"
+                   max="50000"
                 />
               </div>
+              {errors.rewardAmount && <p className="text-red-500 text-xs font-bold w-full text-center relative z-10 mb-4">{errors.rewardAmount}</p>}
               
-              <div className="w-full max-w-sm mt-10 relative z-10">
+              <div className="w-full max-w-sm mt-6 relative z-10">
                 <input 
                   type="range"
-                  min="500"
-                  max="25000"
-                  step="500"
+                  min="5000"
+                  max="50000"
+                  step="1000"
                   value={form.rewardAmount}
                   onChange={(e) => setForm({...form, rewardAmount: Number(e.target.value)})}
                   className="w-full h-3 bg-orange-100 rounded-full appearance-none cursor-pointer accent-orange-500"
                 />
                 <div className="flex justify-between mt-4 text-[10px] font-black text-slate-400 uppercase tracking-widest">
-                  <span>Rs. 500</span>
-                  <span>Rs. 25,000</span>
+                  <span>Rs. 5,000</span>
+                  <span>Rs. 50,000</span>
                 </div>
               </div>
             </div>
@@ -1808,10 +2483,16 @@ function AddQuestFlow({ onCancel, onPublish, isLoaded }: { onCancel: () => void,
             </button>
           )}
           <button 
+            disabled={isPublishing}
             onClick={step === 5 ? () => onPublish(form) : handleNext} 
-            className="flex-1 h-14 bg-slate-900 dark:bg-orange-600 text-white rounded-2xl text-xs font-bold shadow-xl active:scale-[0.98] transition-all uppercase tracking-widest"
+            className="flex-1 h-14 bg-slate-900 dark:bg-orange-600 text-white rounded-2xl text-xs font-bold shadow-xl active:scale-[0.98] transition-all uppercase tracking-widest disabled:opacity-50"
           >
-            {step === 5 ? 'Publish Quest' : 'Continue'}
+            {isPublishing ? (
+              <div className="flex items-center justify-center gap-2">
+                <RefreshCw className="w-4 h-4 animate-spin" />
+                Processing...
+              </div>
+            ) : (step === 5 ? 'Publish Quest' : 'Continue')}
           </button>
         </div>
       </div>
@@ -1977,11 +2658,14 @@ function ChatRoom({ quest, user, messages, onSendMessage, onBack, onFoundIt, onC
   const [showEmoji, setShowEmoji] = useState(false);
   const scrollRef = React.useRef<HTMLDivElement>(null);
 
+  // Strict isolation check
+  const filteredMessages = messages.filter((m: any) => m.questId === quest.id);
+
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [messages]);
+  }, [filteredMessages]);
 
   const emojis = ["👋", "📍", "👀", "💎", "✅", "🙌", "🔥", "🤝"];
 
@@ -2041,32 +2725,40 @@ function ChatRoom({ quest, user, messages, onSendMessage, onBack, onFoundIt, onC
             <p className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest text-center">Safety Chat Protected</p>
          </div>
 
-         {messages.map((m: any) => {
-           const isMe = m.senderId === user.id;
-           return (
-             <motion.div 
-               initial={{ opacity: 0, y: 10, scale: 0.95 }}
-               animate={{ opacity: 1, y: 0, scale: 1 }}
-               key={m.id} 
-               className={`flex flex-col ${isMe ? 'items-end' : 'items-start'}`}
-             >
-               <div className={`flex items-center gap-2 mb-1 px-2 ${isMe ? 'flex-row-reverse' : 'flex-row'}`}>
-                 <span className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">{m.senderName}</span>
-                 <span className="text-[9px] text-slate-300 dark:text-slate-600 font-medium">{new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-               </div>
-               <div className={`max-w-[85%] rounded-[1.5rem] px-5 py-3.5 text-[14px] shadow-sm leading-relaxed ${
-                 isMe 
-                   ? 'bg-slate-900 dark:bg-orange-600 text-white rounded-tr-none font-medium' 
-                   : 'bg-white dark:bg-slate-800 border border-orange-50 dark:border-slate-700 text-slate-700 dark:text-slate-200 rounded-tl-none font-medium'
-               }`}>
-                 {m.imageUrl && (
-                   <img src={m.imageUrl} className="w-full h-auto max-h-80 object-cover rounded-2xl mb-3 shadow-sm border border-slate-50 dark:border-slate-700" />
-                 )}
-                 <p>{m.text}</p>
-               </div>
-             </motion.div>
-           );
-         })}
+        <div className="flex flex-col gap-2">
+          {filteredMessages.length === 0 ? (
+            <div className="flex-1 flex flex-col items-center justify-center py-20 opacity-30 text-center">
+              <MessageSquare className="w-12 h-12 mb-4 text-orange-200" />
+              <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">Secure Line Opening...</p>
+              <p className="text-[8px] mt-2 font-bold text-slate-300 uppercase">Awaiting transmissions from neighbors</p>
+            </div>
+          ) : filteredMessages.map((m: any) => {
+            const isMe = m.senderId === user.id;
+            return (
+              <motion.div 
+                initial={{ opacity: 0, y: 10, scale: 0.95 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                key={m.id} 
+                className={`flex flex-col ${isMe ? 'items-end' : 'items-start'}`}
+              >
+                <div className={`flex items-center gap-2 mb-1 px-2 ${isMe ? 'flex-row-reverse' : 'flex-row'}`}>
+                  <span className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest">{m.senderName}</span>
+                  <span className="text-[9px] text-slate-300 dark:text-slate-600 font-medium">{new Date(m.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                </div>
+                <div className={`max-w-[85%] rounded-[1.5rem] px-5 py-3.5 text-[14px] shadow-sm leading-relaxed ${
+                  isMe 
+                    ? 'bg-slate-900 dark:bg-orange-600 text-white rounded-tr-none font-medium' 
+                    : 'bg-white dark:bg-slate-800 border border-orange-50 dark:border-slate-700 text-slate-700 dark:text-slate-200 rounded-tl-none font-medium'
+                }`}>
+                  {m.imageUrl && (
+                    <img src={m.imageUrl} className="w-full h-auto max-h-80 object-cover rounded-2xl mb-3 shadow-sm border border-slate-50 dark:border-slate-700" />
+                  )}
+                  <p>{m.text}</p>
+                </div>
+              </motion.div>
+            );
+          })}
+        </div>
       </div>
 
       <div className="p-6 bg-white dark:bg-slate-900 border-t border-slate-100 dark:border-slate-800 shrink-0 sticky bottom-0 z-20 transition-colors">

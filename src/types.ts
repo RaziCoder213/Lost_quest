@@ -26,6 +26,9 @@ export interface User {
   rating: number;
   activeQuests: string[]; // IDs
   joinedQuests: string[]; // IDs
+  role?: UserRole;
+  createdAt?: any;
+  updatedAt?: any;
 }
 
 export interface Location {
@@ -69,7 +72,9 @@ export interface Message {
 export interface FoundItemClaim {
   id: string;
   questId: string;
+  questOwnerId?: string;
   helperId: string;
+  helperName?: string;
   evidenceImages: string[];
   foundLocation: { lat: number; lng: number; address: string };
   condition: string;
