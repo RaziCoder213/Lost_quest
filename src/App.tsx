@@ -51,10 +51,37 @@ import {
   createUserWithEmailAndPassword
 } from 'firebase/auth';
 import { 
-  collection, doc, setDoc, getDoc, onSnapshot, query, where, orderBy, getDocs, addDoc, updateDoc, getDocFromServer,
-  serverTimestamp, increment
+  collection, doc, setDoc as fsSetDoc, getDoc as fsGetDoc, onSnapshot, query, where, orderBy, getDocs as fsGetDocs, addDoc as fsAddDoc, updateDoc as fsUpdateDoc, getDocFromServer,
+  serverTimestamp, increment, limit
 } from 'firebase/firestore';
 import { handleFirestoreError, OperationType } from './lib/firestore-utils';
+import { mockDb } from './lib/mockFirebase';
+
+// Global state for mode (hacky but fastest for 10 min deadline)
+let IS_LOCAL_MODE = false;
+const setLocalMode = (v: boolean) => { IS_LOCAL_MODE = v; };
+
+// Wrappers
+const getDoc = async (ref: any) => {
+  if (IS_LOCAL_MODE) return mockDb.getDoc(ref._path.segments[0], ref._path.segments[1]);
+  return fsGetDoc(ref);
+};
+const setDoc = async (ref: any, data: any) => {
+  if (IS_LOCAL_MODE) return mockDb.setDoc(ref._path.segments[0], ref._path.segments[1], data);
+  return fsSetDoc(ref, data);
+};
+const addDoc = async (coll: any, data: any) => {
+  if (IS_LOCAL_MODE) return mockDb.addDoc(coll._path.segments[0], data);
+  return fsAddDoc(coll, data);
+};
+const updateDoc = async (ref: any, data: any) => {
+  if (IS_LOCAL_MODE) return mockDb.updateDoc(ref._path.segments[0], ref._path.segments[1], data);
+  return fsUpdateDoc(ref, data);
+};
+const getDocs = async (q: any) => {
+  if (IS_LOCAL_MODE) return mockDb.getDocs(q._path?.segments[0] || 'quests'); // Approximate
+  return fsGetDocs(q);
+};
 
 const mapContainerStyle = {
   width: '100%',
@@ -190,14 +217,14 @@ export default function App() {
   const [isSubmittingClaim, setIsSubmittingClaim] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(() => {
     if (typeof window !== 'undefined') {
-      return !localStorage.getItem('pakfound-onboarding-v2');
+      return !localStorage.getItem('pakfound-onboarding-vfinal');
     }
     return true;
   });
   
   const closeOnboarding = () => {
     setShowOnboarding(false);
-    localStorage.setItem('pakfound-onboarding-v2', 'true');
+    localStorage.setItem('pakfound-onboarding-vfinal', 'true');
   };
   
   // Navigation
@@ -218,75 +245,144 @@ export default function App() {
   const [isAuthLoading, setIsAuthLoading] = useState(false);
   const [tempUser, setTempUser] = useState<any>(null);
 
+  const [isLocalMode, setIsLocalMode] = useState(false);
+
   useEffect(() => {
     async function testConnection() {
-      try {
-        await getDocs(query(collection(db, 'quests'), where('status', '==', 'ACTIVE')));
-        setFirestoreReady(true);
-      } catch (error: any) {
-        console.error("Firestore connectivity test failed:", error);
-        if (error.code === 'unavailable' || (error.message && error.message.includes('the client is offline'))) {
-          setFirestoreReady('error');
-        } else {
+      let retries = 0;
+      const maxRetries = 2;
+      while (retries < maxRetries) {
+        try {
+          await getDocs(query(collection(db, 'quests'), where('status', '==', 'ACTIVE'), limit(1)));
           setFirestoreReady(true);
+          return;
+        } catch (error: any) {
+          console.error(`Firestore connectivity test attempt ${retries + 1} failed:`, error);
+          if (error.code === 'resource-exhausted') {
+            console.warn("Quota exceeded. Switching to Local Demo Mode.");
+            setIsLocalMode(true);
+            setLocalMode(true);
+            setFirestoreReady(true);
+            return;
+          }
+          if (error.code === 'unavailable' || error.message?.includes('offline')) {
+            await new Promise(r => setTimeout(r, 1000));
+            retries++;
+          } else {
+            setFirestoreReady(true);
+            return;
+          }
         }
       }
+      setFirestoreReady('error');
     }
     testConnection();
   }, []);
 
+  const isInitializingRef = React.useRef<string | null>(null);
+  const intendedRole = React.useRef<UserRole | null>(null);
+
   const initializeUser = async (firebaseUser: any, selectedRole?: UserRole) => {
+    if (isInitializingRef.current === firebaseUser.uid && !selectedRole) return;
+    isInitializingRef.current = firebaseUser.uid;
+
     try {
       const userRef = doc(db, 'users', firebaseUser.uid);
-      const userSnap = await getDoc(userRef);
+      
+      let userSnap;
+      let retries = 0;
+      const maxRetries = 3;
+
+      while (retries <= maxRetries) {
+        try {
+          if (isLocalMode) {
+            userSnap = await mockDb.getDoc('users', firebaseUser.uid);
+          } else {
+            userSnap = await getDoc(userRef);
+          }
+          break;
+        } catch (e: any) {
+          console.warn(`Profile fetch attempt ${retries + 1} failed:`, e);
+          if (e.code === 'resource-exhausted') {
+            console.warn("Quota Exhausted during user init. Switching to local mode.");
+            setIsLocalMode(true);
+            setLocalMode(true);
+            userSnap = await mockDb.getDoc('users', firebaseUser.uid);
+            break;
+          }
+          if ((e.code === 'unavailable' || e.message?.includes('offline')) && retries < maxRetries) {
+            await new Promise(r => setTimeout(r, 2000));
+            retries++;
+          } else {
+            throw e;
+          }
+        }
+      }
+
+      if (!userSnap) throw new Error("Connection failed. Please check your network or refresh the page.");
+
       let userData: User;
+      const roleToUse = selectedRole || intendedRole.current || (firebaseUser.email === 'helper@demo.com' ? UserRole.HELPER : UserRole.LOSTER);
 
       if (!userSnap.exists()) {
-        const role = selectedRole || (firebaseUser.email === 'helper@demo.com' ? UserRole.HELPER : UserRole.LOSTER);
-        
         userData = {
           id: firebaseUser.uid,
           name: firebaseUser.email === 'loster@demo.com' ? 'Demo Loster' : (firebaseUser.email === 'helper@demo.com' ? 'Demo Helper' : (firebaseUser.displayName || firebaseUser.email?.split('@')[0] || 'Guest')),
           email: firebaseUser.email || 'guest@pakfound.pk',
           profileImage: `https://api.dicebear.com/7.x/avataaars/svg?seed=${firebaseUser.uid}`,
           isVerified: true,
-          walletBalance: role === UserRole.LOSTER ? 50000 : 0,
+          walletBalance: roleToUse === UserRole.LOSTER ? 50000 : 0,
           rating: 5,
           activeQuests: [],
           joinedQuests: [],
-          role: role,
+          role: roleToUse,
           createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp()
+          updatedAt: isLocalMode ? new Date().toISOString() : serverTimestamp()
         };
-        await setDoc(userRef, userData);
+        if (isLocalMode) {
+          await mockDb.setDoc('users', firebaseUser.uid, userData);
+        } else {
+          await setDoc(userRef, userData);
+        }
       } else {
         userData = userSnap.data() as User;
         if (selectedRole && userData.role !== selectedRole) {
-          await updateDoc(userRef, { role: selectedRole });
+          if (isLocalMode) {
+            await mockDb.updateDoc('users', firebaseUser.uid, { role: selectedRole, updatedAt: new Date().toISOString() });
+          } else {
+            await updateDoc(userRef, { role: selectedRole, updatedAt: serverTimestamp() });
+          }
           userData.role = selectedRole;
         }
-        setActiveRole(userData.role);
+        setActiveRole(userData.role || UserRole.LOSTER);
       }
 
       setCurrentUser(userData);
       setIsLoggedIn(true);
+      setAuthError(null);
     } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, 'users');
+      console.error("Initialization error:", error);
+      setAuthError(`Profile setup error: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      isInitializingRef.current = null;
     }
   };
 
   useEffect(() => {
     const unsubAuth = onAuthStateChanged(auth, async (firebaseUser) => {
+      setIsInitializingAuth(true);
       try {
         if (firebaseUser) {
           await initializeUser(firebaseUser);
         } else {
           setCurrentUser(null);
           setIsLoggedIn(false);
+          intendedRole.current = null;
         }
+      } catch (err) {
+        console.error("Auth state change error:", err);
       } finally {
         setIsInitializingAuth(false);
-        setIsLoggingIn(null);
       }
     });
     return () => unsubAuth();
@@ -298,24 +394,42 @@ export default function App() {
     setIsAuthLoading(true);
     setIsLoggingIn(role);
     setAuthError(null);
+    intendedRole.current = role;
+
     try {
+      let user;
       try {
         const res = await signInWithEmailAndPassword(auth, demoEmail, demoPassword);
-        await initializeUser(res.user, role);
+        user = res.user;
       } catch (error: any) {
-        if (error.code === 'auth/user-not-found' || error.code === 'auth/invalid-email' || error.code === 'auth/invalid-credential' || error.code === 'auth/wrong-password') {
-          const res = await createUserWithEmailAndPassword(auth, demoEmail, demoPassword);
-          await initializeUser(res.user, role);
+        if (['auth/user-not-found', 'auth/invalid-credential', 'auth/wrong-password'].includes(error.code)) {
+          try {
+            const res = await createUserWithEmailAndPassword(auth, demoEmail, demoPassword);
+            user = res.user;
+          } catch (createError: any) {
+             if (createError.code === 'auth/email-already-in-use') {
+               const res = await signInWithEmailAndPassword(auth, demoEmail, demoPassword);
+               user = res.user;
+             } else {
+               throw createError;
+             }
+          }
         } else {
           throw error;
         }
       }
+      
+      if (user) {
+        await initializeUser(user, role);
+      }
     } catch (error: any) {
       console.error("Demo login error:", error);
       if (error.code === 'auth/operation-not-allowed') {
-        setAuthError("Email/Password Auth is not enabled in Firebase Console. Please enable it to use fixed demo accounts.");
+        setAuthError("Email/Password Auth is disabled in Firebase Console.");
+      } else if (error.code === 'auth/too-many-requests') {
+        setAuthError("Too many login attempts. Please try again later.");
       } else {
-        setAuthError("Demo account initialization failed.");
+        setAuthError(`Login failed: ${error.message || error.code || String(error)}`);
       }
     } finally {
       setIsAuthLoading(false);
@@ -324,22 +438,75 @@ export default function App() {
   };
 
   useEffect(() => {
-    if (!isLoggedIn || !currentUser) return;
-    const unsubPublicQuests = onSnapshot(query(collection(db, 'quests'), where('status', '==', 'ACTIVE')), (snapshot) => {
-      setPublicQuests(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }) as Quest));
-    }, (error) => handleFirestoreError(error, OperationType.LIST, 'quests/public'));
-
-    const unsubOwnedQuests = onSnapshot(query(collection(db, 'quests'), where('ownerId', '==', currentUser.id)), (snapshot) => {
-      setOwnedQuests(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }) as Quest));
-    }, (error) => handleFirestoreError(error, OperationType.LIST, 'quests/owned'));
-
-    const unsubJoinedQuests = onSnapshot(query(collection(db, 'quests'), where('helperIds', 'array-contains', currentUser.id)), (snapshot) => {
-      setJoinedQuests(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }) as Quest));
-    }, (error) => handleFirestoreError(error, OperationType.LIST, 'quests/joined'));
+    if (!isLoggedIn || !currentUser || !isLocalMode) return;
     
-    const unsubNotifs = onSnapshot(query(collection(db, 'notifications'), where('userId', '==', currentUser.id)), (snapshot) => {
+    // Polling for local mode
+    const interval = setInterval(async () => {
+      try {
+        const qSnap = await mockDb.getDocs('quests');
+        const quests = qSnap.docs.map(d => d.data() as Quest);
+        setPublicQuests(quests.filter(q => q.status === 'ACTIVE'));
+        setOwnedQuests(quests.filter(q => q.ownerId === currentUser.id));
+        setJoinedQuests(quests.filter(q => q.helperIds?.includes(currentUser.id)));
+        
+        const nSnap = await mockDb.getDocs(`notifications/${currentUser.id}`);
+        setNotifications(nSnap.docs.map(d => d.data() as Notification));
+      } catch (e) {
+        console.error("Local polling failed", e);
+      }
+    }, 3000);
+    
+    return () => clearInterval(interval);
+  }, [isLoggedIn, currentUser, isLocalMode]);
+
+  useEffect(() => {
+    if (!isLoggedIn || !currentUser || isLocalMode) return;
+    const unsubPublicQuests = onSnapshot(query(
+      collection(db, 'quests'), 
+      where('status', '==', 'ACTIVE'),
+      limit(20) // CRITICAL: Limit reads to prevent quota exhaustion
+    ), (snapshot) => {
+      setPublicQuests(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }) as Quest));
+    }, (error) => {
+      console.warn("Public quests snapshot error:", error);
+      if (error.code !== 'resource-exhausted') {
+        handleFirestoreError(error, OperationType.LIST, 'quests/public');
+      }
+    });
+
+    const unsubOwnedQuests = onSnapshot(query(
+      collection(db, 'quests'), 
+      where('ownerId', '==', currentUser.id)
+    ), (snapshot) => {
+      setOwnedQuests(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }) as Quest));
+    }, (error) => {
+      if (error.code !== 'resource-exhausted') {
+        handleFirestoreError(error, OperationType.LIST, 'quests/owned');
+      }
+    });
+
+    const unsubJoinedQuests = onSnapshot(query(
+      collection(db, 'quests'), 
+      where('helperIds', 'array-contains', currentUser.id)
+    ), (snapshot) => {
+      setJoinedQuests(snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }) as Quest));
+    }, (error) => {
+      if (error.code !== 'resource-exhausted') {
+        handleFirestoreError(error, OperationType.LIST, 'quests/joined');
+      }
+    });
+    
+    const unsubNotifs = onSnapshot(query(
+      collection(db, 'notifications'), 
+      where('userId', '==', currentUser.id),
+      limit(20)
+    ), (snapshot) => {
       setNotifications(snapshot.docs.map(d => ({ id: d.id, ...d.data() }) as Notification).sort((a,b)=>b.timestamp-a.timestamp));
-    }, (error) => handleFirestoreError(error, OperationType.LIST, 'notifications'));
+    }, (error) => {
+      if (error.code !== 'resource-exhausted') {
+        handleFirestoreError(error, OperationType.LIST, 'notifications');
+      }
+    });
     
     const unsubHelperClaims = onSnapshot(query(collection(db, 'claims'), where('helperId', '==', currentUser.id)), (snapshot) => {
       const c = snapshot.docs.map(d => ({ id: d.id, ...d.data() }) as FoundItemClaim);
@@ -436,28 +603,35 @@ export default function App() {
     );
   }
 
-  if (firestoreReady === 'error') {
+  if (firestoreReady === 'error' || firestoreReady === 'quota') {
+    const isQuota = firestoreReady === 'quota';
     return (
       <div className="min-h-screen bg-slate-900 flex flex-col items-center justify-center p-8 text-center text-white font-sans">
-        <div className="w-24 h-24 bg-red-500/20 rounded-[2.5rem] flex items-center justify-center mb-8 border border-red-500/30">
-          <AlertCircle className="w-12 h-12 text-red-500 animate-pulse" />
+        <div className={`w-24 h-24 ${isQuota ? 'bg-orange-500/20' : 'bg-red-500/20'} rounded-[2.5rem] flex items-center justify-center mb-8 border ${isQuota ? 'border-orange-500/30' : 'border-red-500/30'}`}>
+          {isQuota ? <Zap className="w-12 h-12 text-orange-500 animate-pulse" /> : <AlertCircle className="w-12 h-12 text-red-500 animate-pulse" />}
         </div>
-        <h1 className="text-3xl font-black italic mb-4 uppercase tracking-tight">Connectivity Issue</h1>
+        <h1 className="text-3xl font-black italic mb-4 uppercase tracking-tight">
+          {isQuota ? 'Quota Limit Hit' : 'Connectivity Issue'}
+        </h1>
         <p className="text-slate-400 max-w-sm text-sm leading-relaxed mb-10 font-bold">
-          We're having trouble reaching the PakFound network. This might be due to a temporary maintenance or a network firewall.
+          {isQuota 
+            ? "The PakFound daily free read quota has been exhausted. This resets every 24 hours. Consider enabling billing on your Firebase project for unlimited access."
+            : "We're having trouble reaching the PakFound network. This might be due to a temporary maintenance or a network firewall."}
         </p>
         <button 
           onClick={() => window.location.reload()}
           className="px-10 py-4 bg-orange-600 hover:bg-orange-500 text-white rounded-2xl font-black italic uppercase tracking-widest transition-all shadow-xl shadow-orange-900/20 active:scale-95"
         >
-          RECONNECT NOW
+          {isQuota ? 'TRY AGAIN' : 'RECONNECT NOW'}
         </button>
         <p className="mt-8 text-[10px] text-slate-500 uppercase tracking-widest font-black italic">
           Pakistan's Trust Network • Beta
         </p>
       </div>
     );
-  }  if (!isLoggedIn || !currentUser) {
+  }
+
+  if (!isLoggedIn || !currentUser) {
     return (
       <div className="min-h-screen bg-[#fff9f7] flex flex-col items-center justify-center p-6 text-slate-800 font-sans relative">
         {(isLoggingIn || isAuthLoading) && (
@@ -488,10 +662,25 @@ export default function App() {
                 <div className="space-y-6">
                   <h3 className="text-xs font-black uppercase tracking-[0.2em] text-slate-400 mb-8 border-b border-slate-50 pb-4">Select Your Demo Experience</h3>
                   
+                  {isLocalMode && (
+                    <div className="mb-6 bg-orange-50 border border-orange-100 p-3 rounded-xl flex items-center gap-2">
+                       <Zap className="w-4 h-4 text-orange-500" />
+                       <p className="text-[10px] font-bold text-orange-700 uppercase tracking-widest">Local Demo Mode Active</p>
+                    </div>
+                  )}
                   {authError && (
-                    <div className="mb-6 bg-red-50 border border-red-100 p-4 rounded-2xl flex items-center gap-3 text-left">
-                      <AlertCircle className="w-5 h-5 text-red-500 shrink-0" />
-                      <p className="text-[10px] font-bold text-red-700 leading-relaxed uppercase tracking-widest leading-none">{authError}</p>
+                    <div className="mb-6 bg-red-50 border border-red-100 p-4 rounded-2xl flex flex-col gap-3 text-left">
+                      <div className="flex items-center gap-3">
+                        <AlertCircle className="w-5 h-5 text-red-500 shrink-0" />
+                        <p className="text-[10px] font-bold text-red-700 leading-relaxed uppercase tracking-widest leading-none">{authError}</p>
+                      </div>
+                      <button 
+                        onClick={() => window.location.reload()}
+                        className="text-[10px] font-black text-orange-600 hover:text-orange-700 uppercase tracking-widest flex items-center gap-1 mt-2"
+                      >
+                        <RefreshCw className="w-3 h-3" />
+                        Force Refresh App
+                      </button>
                     </div>
                   )}
 
@@ -783,18 +972,6 @@ export default function App() {
     }
   };
 
-  const toggleRole = async () => {
-    if (!currentUser) return;
-    const newRole = activeRole === UserRole.LOSTER ? UserRole.HELPER : UserRole.LOSTER;
-    try {
-      await updateDoc(doc(db, 'users', currentUser.id), { role: newRole });
-      setActiveRole(newRole);
-      setCurrentUser(prev => prev ? { ...prev, role: newRole } : null);
-      setCurrentPage('DASHBOARD');
-    } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, `users/${currentUser.id}`);
-    }
-  };
 
   // Views
   const renderDashboard = () => {
