@@ -34,7 +34,10 @@ import {
   Smile,
   Send,
   Moon,
-  Sun
+  Sun,
+  CreditCard,
+  Settings,
+  HelpCircle
 } from 'lucide-react';
 import { Quest, User, QuestStatus, UserRole, Message, Notification, FoundItemClaim } from './types';
 import { CATEGORIES } from './constants';
@@ -49,7 +52,7 @@ import {
 } from 'firebase/auth';
 import { 
   collection, doc, setDoc, getDoc, onSnapshot, query, where, orderBy, getDocs, addDoc, updateDoc, getDocFromServer,
-  serverTimestamp
+  serverTimestamp, increment
 } from 'firebase/firestore';
 import { handleFirestoreError, OperationType } from './lib/firestore-utils';
 
@@ -113,10 +116,16 @@ function AddressAutocomplete({ onSelect, placeholder, className, isLoaded }: { o
   if (!isLoaded) return <input type="text" placeholder="Loading maps..." disabled className={className} />;
 
   return (
-    <Autocomplete onLoad={onLoad} onPlaceChanged={onPlaceChanged}>
+    <Autocomplete 
+      onLoad={onLoad} 
+      onPlaceChanged={onPlaceChanged}
+      options={{
+        componentRestrictions: { country: 'pk' }
+      }}
+    >
       <input
         type="text"
-        placeholder={placeholder || "Search location..."}
+        placeholder={placeholder || "Search Address..."}
         className={className || "w-full bg-white border border-slate-200 rounded-xl px-4 py-3 text-sm focus:border-orange-500 outline-none transition-all shadow-sm"}
       />
     </Autocomplete>
@@ -177,6 +186,14 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [claims, setClaims] = useState<FoundItemClaim[]>([]);
+  
+  const [isSubmittingClaim, setIsSubmittingClaim] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState(() => {
+    if (typeof window !== 'undefined') {
+      return !localStorage.getItem('pakfound-onboarding-seen');
+    }
+    return true;
+  });
   
   // Navigation
   const [currentPage, setCurrentPage] = useState<'DASHBOARD' | 'MAP' | 'QUESTS' | 'CHAT' | 'PROFILE' | 'ADD_QUEST'>('DASHBOARD');
@@ -706,20 +723,35 @@ export default function App() {
     const claim = claims.find(c => c.id === claimId);
     if (!claim || !currentUser) return;
     
+    // find quest
+    const quest = quests.find(q => q.id === claim.questId);
+    if (!quest) return;
+
     try {
+      // 1. Mark claim as APPROVED
       await updateDoc(doc(db, 'claims', claimId), { 
         status: 'APPROVED',
         updatedAt: serverTimestamp()
       });
+      // 2. Mark quest as COMPLETED
       await updateDoc(doc(db, 'quests', claim.questId), { 
         status: QuestStatus.COMPLETED,
         updatedAt: serverTimestamp()
       });
       
-      // Update wallet if it was a real monetary system (mocking for now)
-      // notify helper
-      await addNotification('ADMIN_APPROVED', claim.questId, "Your finding has been approved by the neighbor! The reward is yours.", claim.helperId);
-      alert("Claim Approved! Reward has been transferred to the neighbor.");
+      // 3. Update Balance (Transfer from Owner to Helper)
+      const helperRef = doc(db, 'users', claim.helperId);
+      const ownerRef = doc(db, 'users', currentUser.id);
+
+      await updateDoc(helperRef, {
+        walletBalance: increment(quest.rewardAmount)
+      });
+      await updateDoc(ownerRef, {
+        walletBalance: increment(-quest.rewardAmount)
+      });
+      
+      await addNotification('ADMIN_APPROVED', claim.questId, "Your finding has been approved by the neighbor! The reward of Rs. " + quest.rewardAmount + " has been added to your wallet.", claim.helperId);
+      alert("Claim Approved! Reward Rs. " + quest.rewardAmount + " has been transferred to the neighbor.");
     } catch (error) {
       handleFirestoreError(error, OperationType.WRITE, `claims/${claimId}`);
     }
@@ -1050,12 +1082,17 @@ export default function App() {
                         onClick={toggleRole}
                         className="w-full flex justify-between items-center px-8 py-5 bg-orange-500 text-white border border-orange-500 hover:bg-orange-600 active:scale-95 transition-all text-sm font-black italic uppercase tracking-widest"
                       >
-                         Switch to {activeRole === UserRole.LOSTER ? 'Helper' : 'Loster'} Mode
+                         I want to be a {activeRole === UserRole.LOSTER ? 'Helper' : 'Loster'}
                          <RefreshCw className="w-4 h-4 text-white" />
                       </button>
-                      {['Security Hub', 'Payout Methods', 'Preferences', 'Help Center'].map(item => (
-                        <button key={item} className="w-full flex justify-between items-center px-8 py-5 bg-white dark:bg-slate-900 border border-slate-50 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800 hover:border-slate-200 dark:hover:border-slate-700 active:scale-95 transition-all text-sm font-black italic uppercase tracking-widest text-slate-600 dark:text-slate-400">
-                           {item}
+                      {[
+                        { name: 'Security', icon: Shield },
+                        { name: 'Payments', icon: CreditCard },
+                        { name: 'Settings', icon: Settings },
+                        { name: 'Help', icon: HelpCircle }
+                      ].map(item => (
+                        <button key={item.name} className="w-full flex justify-between items-center px-8 py-5 bg-white dark:bg-slate-900 border border-slate-50 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800 hover:border-slate-200 dark:hover:border-slate-700 active:scale-95 transition-all text-sm font-black italic uppercase tracking-widest text-slate-600 dark:text-slate-400">
+                           {item.name}
                            <ArrowRight className="w-4 h-4 text-slate-300 dark:text-slate-600" />
                         </button>
                       ))}
@@ -1067,7 +1104,7 @@ export default function App() {
                         }}
                         className="w-full py-6 text-red-500 font-black italic text-sm mt-6 uppercase tracking-[0.3em] active:scale-95 transition-all"
                       >
-                        Terminate Session
+                        Logout
                       </button>
                     </div>
                  </div>
@@ -1191,7 +1228,7 @@ export default function App() {
 
                 <div className="p-8 border-t border-slate-50 dark:border-slate-800 shrink-0 bg-white dark:bg-slate-900 transition-colors">
                   <button 
-                    disabled={claimImages.length === 0 || !claimCondition || claimDistance === null || claimDistance > 500}
+                    disabled={claimImages.length === 0 || !claimCondition || claimDistance === null || claimDistance > 500 || isSubmittingClaim}
                     onClick={async () => {
                         const newClaim = {
                             questId: currentQuest.id,
@@ -1204,22 +1241,39 @@ export default function App() {
                             status: 'PENDING',
                             createdAt: serverTimestamp()
                         };
+                        setIsSubmittingClaim(true);
                         try {
                           await addDoc(collection(db, 'claims'), newClaim);
                           // Update quest status to UNDER_REVIEW
                           await updateDoc(doc(db, 'quests', currentQuest.id), { status: QuestStatus.UNDER_REVIEW });
                           
                           setShowClaimForm(false);
+                          setIsSubmittingClaim(false);
+                          setClaimImages([]);
+                          setClaimCondition('');
+                          setClaimDistance(null);
+                          setClaimLocation(null);
+
                           await addNotification('CLAIM_SUBMITTED', currentQuest.id, `Claim submitted for "${currentQuest.title}". Awaiting neighbor approval.`, currentUser.id);
                           await addNotification('CLAIM_SUBMITTED', currentQuest.id, `${currentUser.name} claims to have found your item! Review the evidence now.`, currentQuest.ownerId);
+                          
+                          // Redirect to Dashboard
                           setCurrentPage('DASHBOARD');
                         } catch (error) {
+                          setIsSubmittingClaim(false);
                           handleFirestoreError(error, OperationType.WRITE, 'claims');
                         }
                     }}
-                    className="w-full py-5 bg-orange-500 hover:bg-orange-600 disabled:opacity-50 disabled:grayscale text-white rounded-2xl font-black italic uppercase tracking-[0.2em] text-sm shadow-xl shadow-orange-100 dark:shadow-none active:scale-95 transition-all"
+                    className="w-full py-5 bg-orange-500 hover:bg-orange-600 disabled:opacity-50 disabled:grayscale text-white rounded-2xl font-black italic uppercase tracking-[0.2em] text-sm shadow-xl shadow-orange-100 dark:shadow-none active:scale-95 transition-all flex items-center justify-center gap-2"
                   >
-                      {claimDistance !== null && claimDistance > 500 ? 'OUTSIDE RADIUS (MIN 500m)' : 'TRANSMIT CLAIM'}
+                      {isSubmittingClaim ? (
+                        <>
+                          <RefreshCw className="w-5 h-5 animate-spin" />
+                          SENDING PROOF...
+                        </>
+                      ) : (
+                        claimDistance !== null && claimDistance > 500 ? 'TOO FAR AWAY (MAX 500m)' : 'SEND PROOF'
+                      )}
                   </button>
                 </div>
               </motion.div>
@@ -1231,6 +1285,108 @@ export default function App() {
 
       {/* Bottom Nav */}
       <BottomNav currentPage={currentPage} setCurrentPage={setCurrentPage} activeRole={activeRole} />
+
+      {/* Onboarding / Instructions Modal */}
+      <AnimatePresence>
+        {showOnboarding && (
+          <motion.div 
+            initial={{ opacity: 0 }} 
+            animate={{ opacity: 1 }} 
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[500] bg-slate-900/60 backdrop-blur-sm p-6 flex items-center justify-center"
+          >
+            <motion.div 
+              initial={{ scale: 0.95, y: 20 }}
+              animate={{ scale: 1, y: 0 }}
+              className="bg-white dark:bg-slate-900 w-full max-w-lg rounded-[2.5rem] shadow-2xl border border-slate-100 dark:border-slate-800 overflow-hidden flex flex-col"
+            >
+               <div className="p-8 bg-orange-500 text-white text-center">
+                  <h2 className="text-3xl font-black italic uppercase tracking-tight">How it Works</h2>
+                  <p className="text-sm font-bold opacity-90 uppercase tracking-widest mt-1">Simple steps to get started</p>
+               </div>
+
+               <div className="p-8 space-y-6">
+                  <div className="space-y-6">
+                    <div className="p-4 bg-orange-50 dark:bg-orange-950/20 border border-orange-100 dark:border-orange-900/30 rounded-2xl flex items-start gap-4">
+                      <div className="w-10 h-10 bg-orange-500 rounded-xl shrink-0 flex items-center justify-center shadow-lg">
+                         <UserIcon className="w-5 h-5 text-white" />
+                      </div>
+                      <div>
+                        <p className="text-[10px] font-black uppercase tracking-widest text-orange-600 mb-1">Your Role: {activeRole}</p>
+                        <p className="text-xs font-bold text-slate-700 dark:text-slate-300">
+                          {activeRole === 'LOSTER' 
+                            ? "You are here to find something you've lost. Neighbors will help you." 
+                            : "You are here to help neighbors find their items and earn rewards."}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div className="space-y-4">
+                       <h3 className="text-lg font-black text-slate-800 dark:text-white uppercase italic">Simple Guide</h3>
+                       <div className="space-y-3">
+                          {activeRole === 'LOSTER' ? [
+                            { text: "Tap (+) button at the bottom to list what you lost.", tab: "Add Item" },
+                            { text: "Set location and add a reward to get help.", tab: "Add Item" },
+                            { text: "Check Home tab for messages from helpers.", tab: "Home" },
+                            { text: "Approve the find in Home tab to pay the reward.", tab: "Home" }
+                          ].map((item, i) => (
+                            <div key={i} className="flex items-center gap-3 p-4 bg-slate-50 dark:bg-slate-800 rounded-2xl border border-slate-100 dark:border-slate-700 shadow-sm">
+                              <span className="text-orange-500 font-black text-xs px-2 py-1 bg-white dark:bg-slate-700 rounded-lg">0{i+1}</span>
+                              <p className="font-bold text-xs text-slate-700 dark:text-slate-200 leading-tight">{item.text}</p>
+                            </div>
+                          )) : [
+                            { text: "Go to Map tab to see lost items near you.", tab: "Map" },
+                            { text: "Tap any item on map and click 'Join Search'.", tab: "Map" },
+                            { text: "Found it? Go to Home tab and click 'Submit Proof'.", tab: "Home" },
+                            { text: "Once owner says yes, money moves to your Wallet.", tab: "Wallet" }
+                          ].map((item, i) => (
+                            <div key={i} className="flex items-center gap-3 p-4 bg-blue-100/30 dark:bg-slate-800 rounded-2xl border border-blue-100/50 dark:border-slate-700 shadow-sm">
+                              <span className="text-blue-500 font-black text-xs px-2 py-1 bg-white dark:bg-slate-700 rounded-lg">0{i+1}</span>
+                              <p className="font-bold text-xs text-slate-700 dark:text-slate-200 leading-tight">{item.text}</p>
+                            </div>
+                          ))}
+                       </div>
+                    </div>
+                  </div>
+
+                  <div className="bg-slate-900 text-white p-6 rounded-3xl text-xs font-medium leading-relaxed italic text-center">
+                    "Helping each other makes our community stronger. Happy searching!"
+                  </div>
+               </div>
+
+               <div className="px-8 pb-8 flex justify-center">
+                  <button 
+                    onClick={() => {
+                      setShowOnboarding(false);
+                      localStorage.setItem('pakfound-onboarding-seen', 'true');
+                    }}
+                    className="w-full py-5 bg-orange-500 hover:bg-orange-600 text-white rounded-2xl text-sm font-black italic uppercase tracking-[0.2em] shadow-lg active:scale-[0.98] transition-all"
+                  >
+                    Got it, let's go!
+                  </button>
+               </div>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Global Submitting Overlay */}
+      <AnimatePresence>
+        {isSubmittingClaim && (
+          <motion.div 
+            initial={{ opacity: 0 }} 
+            animate={{ opacity: 1 }} 
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[1000] bg-slate-900/80 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center"
+          >
+            <div className="w-24 h-24 bg-orange-500 rounded-[2rem] flex items-center justify-center shadow-2xl mb-8">
+              <RefreshCw className="w-10 h-10 text-white animate-spin" />
+            </div>
+            <h3 className="text-2xl font-black italic uppercase text-white tracking-widest mb-2">Transmitting Proof</h3>
+            <p className="text-orange-200 font-bold uppercase text-xs tracking-[0.3em]">Connecting to neighbor network...</p>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Overlay for Notifications */}
       {showNotifs && (
@@ -1455,9 +1611,15 @@ function FullMapView({ quests, onQuestClick, onJoinQuest, searchQuery, onSearch,
   // Sync map center if it changes externally
   useEffect(() => {
     if (map && mapCenter) {
-      map.setCenter(mapCenter);
+      map.panTo(mapCenter);
+      // Zoom out slightly when a manual search or jump happens to show surroundings
+      if (searchQuery) {
+        map.setZoom(13);
+      } else {
+        map.setZoom(15);
+      }
     }
-  }, [map, mapCenter]);
+  }, [map, mapCenter, !!searchQuery]);
 
   // Handle map center update when userLocation is first detected
   useEffect(() => {
@@ -1531,7 +1693,7 @@ function FullMapView({ quests, onQuestClick, onJoinQuest, searchQuery, onSearch,
             <Search className="w-4 h-4 text-slate-400 shrink-0" />
             <input 
               type="text" 
-              placeholder="Search area (e.g. Liberty Market)..." 
+              placeholder="Search Area or Address..." 
               value={searchQuery}
               onChange={(e) => onSearch(e.target.value)}
               className="flex-1 bg-transparent border-none focus:ring-0 text-xs font-bold text-slate-900 placeholder:text-slate-300 h-full"
@@ -1700,7 +1862,7 @@ function FullMapView({ quests, onQuestClick, onJoinQuest, searchQuery, onSearch,
                         onClick={() => onQuestClick(selectedQuest.id)}
                         className="flex-1 py-2.5 bg-slate-900 text-white rounded-xl text-[9px] font-black italic uppercase tracking-[0.15em] shadow-lg shadow-slate-200 active:scale-95 transition-all"
                       >
-                        Scanner
+                        Item Details
                       </button>
                       <button 
                         onClick={() => {
@@ -1708,9 +1870,9 @@ function FullMapView({ quests, onQuestClick, onJoinQuest, searchQuery, onSearch,
                             onJoinQuest(selectedQuest.id);
                           }
                         }}
-                         className="flex-1 py-2.5 bg-orange-500 text-white rounded-xl text-[9px] font-black italic uppercase tracking-[0.15em] shadow-lg shadow-orange-200 active:scale-95 transition-all"
+                         className="flex-1 py-2.5 bg-orange-500 text-white rounded-xl text-[9px] font-black italic uppercase tracking-[0.15em] shadow-lg shadow-orange-200 active:scale-95 transition-all animate-pulse"
                       >
-                        Join Quest
+                        Join Search
                       </button>
                     </div>
                   </div>
@@ -1996,66 +2158,155 @@ function QuestCard({ quest, onClick, onChatClick }: QuestCardProps) {
 
 function HelperDashboard({ quests, joinedQuests, onQuestClick, onJoinQuest, onChatClick, searchQuery, onSearch, onSelectSuggestion, suggestions, onDetectLocation, mapCenter, userLocation, isLoaded }: any) {
   const [hoveredQuestId, setHoveredQuestId] = useState<string | null>(null);
+  const [viewMode, setViewMode] = useState<'MAP' | 'LIST'>('MAP');
 
   return (
     <div className="h-[calc(100vh-140px)] lg:h-[calc(100vh-100px)] relative px-4 lg:px-0 flex flex-col">
-      <FullMapView 
-        quests={quests} 
-        onQuestClick={onQuestClick} 
-        onJoinQuest={onJoinQuest}
-        searchQuery={searchQuery} 
-        onSearch={onSearch} 
-        onSelectSuggestion={onSelectSuggestion}
-        suggestions={suggestions} 
-        onDetectLocation={onDetectLocation} 
-        mapCenter={mapCenter} 
-        userLocation={userLocation}
-        isLoaded={isLoaded}
-        hoveredQuestId={hoveredQuestId}
-      />
+      {/* View Switcher Tabs */}
+      <div className="flex bg-white/80 dark:bg-slate-900/80 backdrop-blur-md rounded-2xl p-1 mb-4 gap-1 shadow-sm border border-slate-100 dark:border-slate-800 self-center z-40 mt-2">
+        <button 
+          onClick={() => setViewMode('MAP')}
+          className={`px-6 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2 ${viewMode === 'MAP' ? 'bg-orange-500 text-white shadow-lg shadow-orange-100' : 'text-slate-400 hover:text-slate-600'}`}
+        >
+          <MapIcon className="w-3.5 h-3.5" />
+          Map Search
+        </button>
+        <button 
+          onClick={() => setViewMode('LIST')}
+          className={`px-6 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2 ${viewMode === 'LIST' ? 'bg-orange-500 text-white shadow-lg shadow-orange-100' : 'text-slate-400 hover:text-slate-600'}`}
+        >
+          <Package className="w-3.5 h-3.5" />
+          My Activity
+          {joinedQuests.length > 0 && <span className="ml-1 bg-white/20 text-white w-4 h-4 rounded-full flex items-center justify-center text-[8px]">{joinedQuests.length}</span>}
+        </button>
+      </div>
 
-      {/* Joined Quests Floating Panel */}
-      {joinedQuests.length > 0 && (
-        <div className="absolute top-24 right-6 w-80 z-30 hidden lg:block">
-          <div className="bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border border-orange-100 dark:border-slate-800 rounded-[2rem] p-5 shadow-2xl transition-colors max-h-[50vh] overflow-y-auto custom-scrollbar">
-            <div className="flex items-center justify-between mb-4 px-2">
-               <h3 className="text-xs font-bold uppercase tracking-widest text-slate-500 dark:text-slate-400 flex items-center gap-2">
-                 <ShieldCheck className="w-4 h-4 text-orange-500" />
-                 Active Jobs
-               </h3>
-               <span className="text-[10px] font-bold text-orange-500">{joinedQuests.length}</span>
-            </div>
-            <div className="space-y-3">
-              {joinedQuests.map((q: Quest) => (
-                <div key={q.id} className="bg-orange-50/50 dark:bg-slate-800 border border-orange-100 dark:border-slate-700 rounded-2xl p-3 flex items-center gap-4 group hover:bg-orange-100/50 dark:hover:bg-slate-700 transition-all">
-                   <img src={q.images[0]} className="w-10 h-10 rounded-xl object-cover shadow-sm" />
-                   <div className="flex-1 min-w-0">
-                      <h4 className="text-[10px] font-bold text-slate-900 dark:text-white truncate uppercase">{q.title}</h4>
-                      <p className="text-[9px] text-slate-500 dark:text-slate-400 truncate font-medium">{q.locations[0]?.name.split(',')[0]}</p>
-                   </div>
-                   <div className="flex gap-2">
-                     <button onClick={() => onChatClick(q.id)} className="w-7 h-7 bg-orange-500 rounded-lg flex items-center justify-center text-white shadow-sm hover:scale-110 transition-transform">
-                        <MessageSquare className="w-3.5 h-3.5" />
-                     </button>
-                   </div>
+      <div className="flex-1 relative overflow-hidden">
+        {viewMode === 'MAP' ? (
+          <FullMapView 
+            quests={quests} 
+            onQuestClick={onQuestClick} 
+            onJoinQuest={onJoinQuest}
+            searchQuery={searchQuery} 
+            onSearch={onSearch} 
+            onSelectSuggestion={onSelectSuggestion}
+            suggestions={suggestions} 
+            onDetectLocation={onDetectLocation} 
+            mapCenter={mapCenter} 
+            userLocation={userLocation}
+            isLoaded={isLoaded}
+            hoveredQuestId={hoveredQuestId}
+          />
+        ) : (
+          <div className="h-full overflow-y-auto pb-32 space-y-8 px-2 lg:px-10">
+            <div className="max-w-4xl mx-auto space-y-10">
+              <section>
+                <div className="flex items-center gap-3 mb-6">
+                  <div className="w-1 h-6 bg-orange-500 rounded-full"></div>
+                  <h2 className="text-xl font-black italic uppercase text-slate-900 dark:text-white">Active Jobs</h2>
                 </div>
-              ))}
+                <div className="grid gap-6">
+                  {joinedQuests.filter((q: any) => q.status !== QuestStatus.COMPLETED).length === 0 ? (
+                    <div className="bg-white dark:bg-slate-800 p-12 rounded-[2.5rem] border border-orange-50 dark:border-slate-700 text-center space-y-4">
+                       <Compass className="w-10 h-10 text-orange-200 mx-auto" />
+                       <p className="text-sm font-bold text-slate-400">No active searches. Join a quest from the map!</p>
+                    </div>
+                  ) : joinedQuests.filter((q: any) => q.status !== QuestStatus.COMPLETED).map((q: Quest) => (
+                    <div key={q.id} className="bg-white dark:bg-slate-800 rounded-[2.5rem] p-6 border border-orange-50 dark:border-slate-700 shadow-sm flex gap-6 hover:shadow-xl transition-all group">
+                       <img src={q.images[0]} className="w-24 h-24 rounded-3xl object-cover shadow-md group-hover:scale-105 transition-transform" />
+                       <div className="flex-1 min-w-0 flex flex-col justify-center">
+                          <div className="flex justify-between items-start mb-2">
+                            <h3 className="text-lg font-black italic uppercase text-slate-900 dark:text-white truncate">{q.title}</h3>
+                            <span className="text-[9px] font-black text-orange-500 bg-orange-50 px-2 py-1 rounded-full uppercase italic">{q.status}</span>
+                          </div>
+                          <div className="flex items-center gap-4 text-[10px] font-bold text-slate-400 uppercase tracking-widest">
+                            <div className="flex items-center gap-1.5"><MapPin className="w-3.5 h-3.5" /> {q.locations[0]?.name.split(',')[0]}</div>
+                            <div className="flex items-center gap-1.5"><Zap className="w-3.5 h-3.5 text-orange-500" /> Rs. {q.rewardAmount}</div>
+                          </div>
+                       </div>
+                       <div className="flex flex-col gap-2 justify-center">
+                          <button onClick={() => onChatClick(q.id)} className="px-6 py-3 bg-slate-900 hover:bg-slate-800 text-white rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all active:scale-95">Open Chat</button>
+                          <button onClick={() => onQuestClick(q.id)} className="px-6 py-3 bg-white border border-slate-200 hover:bg-slate-50 text-slate-600 rounded-xl text-[10px] font-bold uppercase tracking-widest transition-all active:scale-95">Mission Brief</button>
+                       </div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+
+              <section>
+                <div className="flex items-center gap-3 mb-6 opacity-50">
+                  <div className="w-1 h-6 bg-slate-400 rounded-full"></div>
+                  <h2 className="text-xl font-black italic uppercase text-slate-500 dark:text-slate-400">Completed & Closed</h2>
+                </div>
+                 <div className="grid gap-6">
+                  {joinedQuests.filter((q: any) => q.status === QuestStatus.COMPLETED).length === 0 ? (
+                    <div className="bg-slate-50 dark:bg-slate-900/30 p-10 rounded-[2.5rem] border border-dashed border-slate-200 dark:border-slate-800 text-center">
+                       <p className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">History Empty</p>
+                    </div>
+                  ) : joinedQuests.filter((q: any) => q.status === QuestStatus.COMPLETED).map((q: Quest) => (
+                    <div key={q.id} className="bg-white/50 dark:bg-slate-900/50 rounded-[2.5rem] p-6 border border-slate-100 dark:border-slate-800 flex gap-6 opacity-60 grayscale hover:grayscale-0 hover:opacity-100 transition-all">
+                       <img src={q.images[0]} className="w-20 h-20 rounded-2xl object-cover shadow-sm" />
+                       <div className="flex-1 min-w-0 flex flex-col justify-center">
+                          <h3 className="text-sm font-black italic uppercase text-slate-900 dark:text-white truncate">{q.title}</h3>
+                          <p className="text-[10px] font-bold text-green-600 uppercase tracking-widest mt-1">Status: Mission Completed</p>
+                       </div>
+                       <div className="flex items-center">
+                          <div className="bg-green-100 text-green-700 p-3 rounded-full">
+                            <CheckCircle2 className="w-6 h-6" />
+                          </div>
+                       </div>
+                    </div>
+                  ))}
+                </div>
+              </section>
             </div>
           </div>
-        </div>
-      )}
+        )}
 
-      {/* Mobile Jobs Badge */}
-      {joinedQuests.length > 0 && (
-        <div className="lg:hidden absolute top-20 right-4 z-40">
-           <button 
-             className="w-10 h-10 bg-orange-500 text-white rounded-xl shadow-xl flex items-center justify-center relative active:scale-95 transition-all"
-           >
-              <ShieldCheck className="w-5 h-5" />
-              <div className="absolute -top-1 -right-1 w-4 h-4 bg-slate-900 text-[8px] font-bold flex items-center justify-center rounded-full border border-white">{joinedQuests.length}</div>
-           </button>
-        </div>
-      )}
+        {/* Joined Quests Floating Panel (Only on Map Mode) */}
+        {viewMode === 'MAP' && joinedQuests.length > 0 && (
+          <div className="absolute top-24 right-6 w-80 z-30 hidden lg:block">
+            <div className="bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border border-orange-100 dark:border-slate-800 rounded-[2rem] p-5 shadow-2xl transition-colors max-h-[50vh] overflow-y-auto custom-scrollbar">
+              <div className="flex items-center justify-between mb-4 px-2">
+                 <h3 className="text-xs font-bold uppercase tracking-widest text-slate-500 dark:text-slate-400 flex items-center gap-2">
+                   <ShieldCheck className="w-4 h-4 text-orange-500" />
+                   Active Jobs
+                 </h3>
+                 <span className="text-[10px] font-bold text-orange-50">{joinedQuests.length}</span>
+              </div>
+              <div className="space-y-3">
+                {joinedQuests.map((q: Quest) => (
+                  <div key={q.id} className="bg-orange-50/50 dark:bg-slate-800 border border-orange-100 dark:border-slate-700 rounded-2xl p-3 flex items-center gap-4 group hover:bg-orange-100/50 dark:hover:bg-slate-700 transition-all">
+                     <img src={q.images[0]} className="w-10 h-10 rounded-xl object-cover shadow-sm" />
+                     <div className="flex-1 min-w-0">
+                        <h4 className="text-[10px] font-bold text-slate-900 dark:text-white truncate uppercase">{q.title}</h4>
+                        <p className="text-[9px] text-slate-500 dark:text-slate-400 truncate font-medium">{q.locations[0]?.name.split(',')[0]}</p>
+                     </div>
+                     <div className="flex gap-2">
+                       <button onClick={() => onChatClick(q.id)} className="w-7 h-7 bg-orange-500 rounded-lg flex items-center justify-center text-white shadow-sm hover:scale-110 transition-transform">
+                          <MessageSquare className="w-3.5 h-3.5" />
+                       </button>
+                     </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Mobile Jobs Badge (Only on Map Mode) */}
+        {viewMode === 'MAP' && joinedQuests.length > 0 && (
+          <div className="lg:hidden absolute top-20 right-4 z-40">
+             <button 
+               onClick={() => setViewMode('LIST')}
+               className="w-10 h-10 bg-orange-500 text-white rounded-xl shadow-xl flex items-center justify-center relative active:scale-95 transition-all"
+             >
+                <ShieldCheck className="w-5 h-5" />
+                <div className="absolute -top-1 -right-1 w-4 h-4 bg-slate-900 text-[8px] font-bold flex items-center justify-center rounded-full border border-white">{joinedQuests.length}</div>
+             </button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

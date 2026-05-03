@@ -30,37 +30,39 @@ service cloud.firestore {
     // --- Users ---
     match /users/{userId} {
       function isValidUser(data) {
-        return data.id == userId &&
-               data.name is string && data.name.size() <= 100 &&
-               data.email is string && data.email.size() <= 100 &&
-               data.walletBalance is number &&
-               data.rating is number;
+        return (data.get('id', userId) == userId) &&
+               (data.get('name', '') is string && data.get('name', '').size() <= 100) &&
+               (data.get('email', '') is string && data.get('email', '').size() <= 100) &&
+               (data.get('walletBalance', 0) is number) &&
+               (data.get('rating', 0) is number) &&
+               (data.get('role', 'LOSTER') in ['LOSTER', 'HELPER']);
       }
 
       allow get: if isSignedIn();
       allow create: if isOwner(userId) && isValidUser(incoming()) &&
                       incoming().keys().hasAll(['id', 'name', 'email', 'profileImage', 'isVerified', 'walletBalance', 'rating', 'activeQuests', 'joinedQuests', 'role', 'createdAt', 'updatedAt']) &&
                       incoming().keys().size() == 12;
-      allow update: if isOwner(userId) && (
-        (incoming().diff(existing()).affectedKeys().hasOnly(['name', 'profileImage', 'activeQuests', 'joinedQuests', 'role', 'updatedAt']) &&
-         isValidUser(incoming()))
+      allow update: if isOwner(userId) && isValidUser(incoming()) && (
+        incoming().diff(existing()).affectedKeys().hasOnly(['name', 'profileImage', 'activeQuests', 'joinedQuests', 'role', 'updatedAt', 'walletBalance', 'rating'])
       );
     }
 
     // --- Quests ---
     match /quests/{questId} {
       function isValidQuest(data) {
-        return data.ownerId is string &&
-               data.title is string && data.title.size() <= 200 &&
-               data.rewardAmount is number && data.rewardAmount >= 0 &&
-               data.status in ['ACTIVE', 'FOUND_CLAIMED', 'UNDER_REVIEW', 'COMPLETED', 'CANCELLED'];
+        return (data.get('ownerId', request.auth.uid) is string) &&
+               (data.get('title', '') is string && data.get('title', '').size() <= 200) &&
+               (data.get('rewardAmount', 0) is number && data.get('rewardAmount', 0) >= 0) &&
+               (data.get('status', 'ACTIVE') in ['ACTIVE', 'FOUND_CLAIMED', 'UNDER_REVIEW', 'COMPLETED', 'CANCELLED']);
       }
 
       allow get: if true; 
       
-      allow list: if resource.data.status == 'ACTIVE';
-      allow list: if isSignedIn() && resource.data.ownerId == request.auth.uid;
-      allow list: if isSignedIn() && resource.data.helperIds is list && request.auth.uid in resource.data.helperIds;
+      allow list: if isSignedIn() && (
+        resource.data.status == 'ACTIVE' || 
+        resource.data.ownerId == request.auth.uid || 
+        (resource.data.get('helperIds', []) is list && request.auth.uid in resource.data.helperIds)
+      );
 
       allow create: if isSignedIn() && isValidQuest(incoming()) &&
                       incoming().ownerId == request.auth.uid &&
@@ -68,15 +70,19 @@ service cloud.firestore {
                       incoming().updatedAt == request.time &&
                       isValidId(questId);
 
-      allow update: if isSignedIn() && (
+      allow update: if isSignedIn() && isValidQuest(incoming()) && (
         // Action: Join
         (incoming().diff(existing()).affectedKeys().hasOnly(['helperIds', 'updatedAt']) &&
          incoming().helperIds is list &&
-         incoming().helperIds.size() > existing().helperIds.size() &&
+         incoming().helperIds.size() > existing().get('helperIds', []).size() &&
          request.auth.uid in incoming().helperIds &&
          incoming().updatedAt == request.time) ||
         // Action: Change Status/Edit by Owner
-        (isOwner(existing().ownerId) && isValidQuest(incoming()) &&
+        (isOwner(existing().ownerId) && 
+         incoming().updatedAt == request.time) ||
+        // Action: AI Insights addition
+        (isOwner(existing().ownerId) && 
+         incoming().diff(existing()).affectedKeys().hasOnly(['aiRecoverySuggestions', 'updatedAt']) &&
          incoming().updatedAt == request.time)
       );
     }
