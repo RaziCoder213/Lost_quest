@@ -190,10 +190,15 @@ export default function App() {
   const [isSubmittingClaim, setIsSubmittingClaim] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(() => {
     if (typeof window !== 'undefined') {
-      return !localStorage.getItem('pakfound-onboarding-seen');
+      return !localStorage.getItem('pakfound-onboarding-v2');
     }
     return true;
   });
+  
+  const closeOnboarding = () => {
+    setShowOnboarding(false);
+    localStorage.setItem('pakfound-onboarding-v2', 'true');
+  };
   
   // Navigation
   const [currentPage, setCurrentPage] = useState<'DASHBOARD' | 'MAP' | 'QUESTS' | 'CHAT' | 'PROFILE' | 'ADD_QUEST'>('DASHBOARD');
@@ -1063,12 +1068,11 @@ export default function App() {
                     </div>
                     <h2 className="text-3xl font-black italic tracking-tight text-slate-900 dark:text-white">{currentUser.name}</h2>
                     <p className="text-slate-400 dark:text-slate-500 font-bold text-sm tracking-widest mt-1 uppercase">{currentUser.email}</p>
-                    
-                    <div className={`grid ${activeRole === UserRole.HELPER ? 'grid-cols-2' : 'grid-cols-1'} gap-6 w-full mt-10`}>
+                       <div className={`grid ${activeRole === UserRole.HELPER ? 'grid-cols-2' : 'grid-cols-1'} gap-6 w-full mt-10`}>
                        {activeRole === UserRole.HELPER && (
                         <div className="bg-slate-50 dark:bg-slate-900/50 p-6 rounded-[2rem] border border-slate-100 dark:border-slate-700 flex flex-col items-center transition-colors">
                             <span className="text-[10px] font-black text-orange-500 uppercase tracking-[0.2em] mb-2">Wallet</span>
-                            <span className="text-2xl font-black italic tracking-tighter text-slate-900 dark:text-white text-balance">${currentUser.walletBalance}</span>
+                            <span className="text-2xl font-black italic tracking-tighter text-slate-900 dark:text-white text-balance">Rs. {currentUser.walletBalance}</span>
                         </div>
                        )}
                        <div className="bg-slate-50 dark:bg-slate-900/50 p-6 rounded-[2rem] border border-slate-100 dark:border-slate-700 flex flex-col items-center transition-colors">
@@ -1078,13 +1082,6 @@ export default function App() {
                     </div>
 
                     <div className="w-full mt-12 space-y-3">
-                      <button 
-                        onClick={toggleRole}
-                        className="w-full flex justify-between items-center px-8 py-5 bg-orange-500 text-white border border-orange-500 hover:bg-orange-600 active:scale-95 transition-all text-sm font-black italic uppercase tracking-widest"
-                      >
-                         I want to be a {activeRole === UserRole.LOSTER ? 'Helper' : 'Loster'}
-                         <RefreshCw className="w-4 h-4 text-white" />
-                      </button>
                       {[
                         { name: 'Security', icon: Shield },
                         { name: 'Payments', icon: CreditCard },
@@ -1298,71 +1295,53 @@ export default function App() {
             <motion.div 
               initial={{ scale: 0.95, y: 20 }}
               animate={{ scale: 1, y: 0 }}
-              className="bg-white dark:bg-slate-900 w-full max-w-lg rounded-[2.5rem] shadow-2xl border border-slate-100 dark:border-slate-800 overflow-hidden flex flex-col"
+              className="bg-white dark:bg-slate-900 w-full max-w-sm rounded-[2rem] shadow-2xl overflow-hidden flex flex-col border border-slate-100 dark:border-slate-800"
             >
-               <div className="p-8 bg-orange-500 text-white text-center">
-                  <h2 className="text-3xl font-black italic uppercase tracking-tight">How it Works</h2>
-                  <p className="text-sm font-bold opacity-90 uppercase tracking-widest mt-1">Simple steps to get started</p>
+               <div className="p-6 bg-orange-500 text-white text-center">
+                  <h2 className="text-2xl font-black italic uppercase tracking-tight">How to use PakFound</h2>
+                  <p className="text-[10px] font-bold opacity-90 uppercase tracking-widest mt-1">Simple neighborhood guide</p>
                </div>
-
-               <div className="p-8 space-y-6">
-                  <div className="space-y-6">
-                    <div className="p-4 bg-orange-50 dark:bg-orange-950/20 border border-orange-100 dark:border-orange-900/30 rounded-2xl flex items-start gap-4">
-                      <div className="w-10 h-10 bg-orange-500 rounded-xl shrink-0 flex items-center justify-center shadow-lg">
-                         <UserIcon className="w-5 h-5 text-white" />
+               
+               <div className="p-6 space-y-6">
+                  <div className="space-y-4">
+                    {activeRole === 'LOSTER' ? (
+                      <div className="space-y-4">
+                        <div className="flex items-center gap-3 p-3 bg-orange-50 dark:bg-orange-950/20 rounded-xl">
+                          <div className="w-8 h-8 bg-orange-500 rounded-lg flex items-center justify-center text-white font-black text-xs">A</div>
+                          <p className="text-xs font-bold text-slate-700 dark:text-slate-300">Lost something? Tap the (+) Add button below.</p>
+                        </div>
+                        <div className="flex items-center gap-3 p-3 bg-orange-50 dark:bg-orange-950/20 rounded-xl">
+                          <div className="w-8 h-8 bg-orange-500 rounded-lg flex items-center justify-center text-white font-black text-xs">B</div>
+                          <p className="text-xs font-bold text-slate-700 dark:text-slate-300">Set the reward price and pin the location.</p>
+                        </div>
+                        <div className="flex items-center gap-3 p-3 bg-orange-50 dark:bg-orange-950/20 rounded-xl">
+                          <div className="w-8 h-8 bg-orange-500 rounded-lg flex items-center justify-center text-white font-black text-xs">C</div>
+                          <p className="text-xs font-bold text-slate-700 dark:text-slate-300">Go to Home tab to see if anyone found it.</p>
+                        </div>
                       </div>
-                      <div>
-                        <p className="text-[10px] font-black uppercase tracking-widest text-orange-600 mb-1">Your Role: {activeRole}</p>
-                        <p className="text-xs font-bold text-slate-700 dark:text-slate-300">
-                          {activeRole === 'LOSTER' 
-                            ? "You are here to find something you've lost. Neighbors will help you." 
-                            : "You are here to help neighbors find their items and earn rewards."}
-                        </p>
+                    ) : (
+                      <div className="space-y-4">
+                        <div className="flex items-center gap-3 p-3 bg-orange-50 dark:bg-orange-950/20 rounded-xl">
+                          <div className="w-8 h-8 bg-orange-500 rounded-lg flex items-center justify-center text-white font-black text-xs">A</div>
+                          <p className="text-xs font-bold text-slate-700 dark:text-slate-300">Find lost items near you in the Map tab.</p>
+                        </div>
+                        <div className="flex items-center gap-3 p-3 bg-orange-50 dark:bg-orange-950/20 rounded-xl">
+                          <div className="w-8 h-8 bg-orange-500 rounded-lg flex items-center justify-center text-white font-black text-xs">B</div>
+                          <p className="text-xs font-bold text-slate-700 dark:text-slate-300">Join a search and send photo if you find it.</p>
+                        </div>
+                        <div className="flex items-center gap-3 p-3 bg-orange-50 dark:bg-orange-950/20 rounded-xl">
+                          <div className="w-8 h-8 bg-orange-500 rounded-lg flex items-center justify-center text-white font-black text-xs">C</div>
+                          <p className="text-xs font-bold text-slate-700 dark:text-slate-300">Track your earnings in the Wallet.</p>
+                        </div>
                       </div>
-                    </div>
-
-                    <div className="space-y-4">
-                       <h3 className="text-lg font-black text-slate-800 dark:text-white uppercase italic">Simple Guide</h3>
-                       <div className="space-y-3">
-                          {activeRole === 'LOSTER' ? [
-                            { text: "Tap (+) button at the bottom to list what you lost.", tab: "Add Item" },
-                            { text: "Set location and add a reward to get help.", tab: "Add Item" },
-                            { text: "Check Home tab for messages from helpers.", tab: "Home" },
-                            { text: "Approve the find in Home tab to pay the reward.", tab: "Home" }
-                          ].map((item, i) => (
-                            <div key={i} className="flex items-center gap-3 p-4 bg-slate-50 dark:bg-slate-800 rounded-2xl border border-slate-100 dark:border-slate-700 shadow-sm">
-                              <span className="text-orange-500 font-black text-xs px-2 py-1 bg-white dark:bg-slate-700 rounded-lg">0{i+1}</span>
-                              <p className="font-bold text-xs text-slate-700 dark:text-slate-200 leading-tight">{item.text}</p>
-                            </div>
-                          )) : [
-                            { text: "Go to Map tab to see lost items near you.", tab: "Map" },
-                            { text: "Tap any item on map and click 'Join Search'.", tab: "Map" },
-                            { text: "Found it? Go to Home tab and click 'Submit Proof'.", tab: "Home" },
-                            { text: "Once owner says yes, money moves to your Wallet.", tab: "Wallet" }
-                          ].map((item, i) => (
-                            <div key={i} className="flex items-center gap-3 p-4 bg-blue-100/30 dark:bg-slate-800 rounded-2xl border border-blue-100/50 dark:border-slate-700 shadow-sm">
-                              <span className="text-blue-500 font-black text-xs px-2 py-1 bg-white dark:bg-slate-700 rounded-lg">0{i+1}</span>
-                              <p className="font-bold text-xs text-slate-700 dark:text-slate-200 leading-tight">{item.text}</p>
-                            </div>
-                          ))}
-                       </div>
-                    </div>
+                    )}
                   </div>
-
-                  <div className="bg-slate-900 text-white p-6 rounded-3xl text-xs font-medium leading-relaxed italic text-center">
-                    "Helping each other makes our community stronger. Happy searching!"
-                  </div>
-               </div>
-
-               <div className="px-8 pb-8 flex justify-center">
+                  
                   <button 
-                    onClick={() => {
-                      setShowOnboarding(false);
-                      localStorage.setItem('pakfound-onboarding-seen', 'true');
-                    }}
-                    className="w-full py-5 bg-orange-500 hover:bg-orange-600 text-white rounded-2xl text-sm font-black italic uppercase tracking-[0.2em] shadow-lg active:scale-[0.98] transition-all"
+                    onClick={closeOnboarding}
+                    className="w-full py-4 bg-orange-500 hover:bg-orange-600 text-white rounded-xl text-xs font-black italic uppercase tracking-[0.2em] shadow-lg active:scale-[0.98] transition-all"
                   >
-                    Got it, let's go!
+                    Got it!
                   </button>
                </div>
             </motion.div>
